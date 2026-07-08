@@ -1,0 +1,1972 @@
+from .utils import *
+from .constants import SUBSET_CENTER_LOG_SCALE
+from .dat1 import DAT1_BLOCK_TABLE_ENTRY_SIZE, DAT1_FILE_ID, DAT1_FIXUP_TABLE_ENTRY_SIZE, DAT1_HEADER_SIZE
+from .hashes import BLOCK_HASHES, string_crc32
+from .model_import import (
+    MODEL_MATERIAL_INFO_SIZE,
+    MODEL_MATERIAL_SIZE,
+    MODEL_SUBSET_BASE_OFFSET,
+    MODEL_SUBSET_FLAGS_OFFSET,
+    MODEL_SUBSET_INDEX_COUNT_OFFSET,
+    MODEL_SUBSET_INDEX_DATA_OFFSET,
+    MODEL_SUBSET_MATERIAL_INDEX_OFFSET,
+    MODEL_SUBSET_MPU_OFFSET,
+    MODEL_SUBSET_RECORD_SIZE,
+    MODEL_SUBSET_UV_LOG_OFFSET,
+    MODEL_SUBSET_VERTEX_COUNT_OFFSET,
+    MODEL_SUBSET_VERTEX_STD_OFFSET,
+    MODEL_SUBSET_VERTEX_UV12_OFFSET,
+    MODEL_UV_FLOAT_TO_FIXED_BASE,
+    SKIN_CLUSTER_FULL_INDEX_BIT,
+    SKIN_CLUSTER_INFLUENCE_SHIFT,
+    SKIN_CLUSTER_JOINT_OFFSET_SHIFT,
+    SKIN_CLUSTER_OFFSET_MASK,
+    SKIN_CLUSTER_VERTEX_COUNT,
+    SKIN_CLUSTER_WORD_BYTES,
+    SKIN_WEIGHT_SCALE,
+    SUBSET_FLAG_HAS_UV1,
+    SUBSET_FLAG_HAS_UV2,
+    SUBSET_FLAG_SKINNED,
+    _parse_model_materials,
+    _read_c_string,
+)
+
+DAT1_BLOCK_ALIGN = 16
+DAT1_CACHELINE_ALIGN = 64
+STG_MAGIC = 0x00475453
+STG_VERSION = 0x1
+STG_HEADER_ALIGN = 16
+
+MODEL_BUILT_SIZE = 96
+MODEL_LOOK_SIZE = 64
+MODEL_LOOK_BUILT_SIZE = 80
+MODEL_LOOK_GROUP_SIZE = 24
+MODEL_STD_VERTEX_SIZE = 16
+MODEL_MAX_VERTEX_COUNT = 0xFFFF
+MODEL_SPLIT_VERTEX_TARGET = 60000
+MODEL_DEFAULT_MPU = 1.0 / 32768.0
+
+SUBSET_FLAG_HAS_ANIM_VERT = 0x0002
+SUBSET_FLAG_HAS_COLOR = 0x0010
+SUBSET_FLAG_HAS_ORIGIN_OFFSET = 0x4000
+SUBSET_EXPORT_FLAG_CLEAR_MASK = (
+    SUBSET_FLAG_SKINNED
+    | SUBSET_FLAG_HAS_ANIM_VERT
+    | SUBSET_FLAG_HAS_UV1
+    | SUBSET_FLAG_HAS_UV2
+    | SUBSET_FLAG_HAS_COLOR
+    | SUBSET_FLAG_HAS_ORIGIN_OFFSET
+)
+
+MODEL_FLAG_HAS_SKINNING = 1 << 1
+MODEL_FLAG_HAS_GPU_SKINNING = 1 << 2
+MODEL_FLAG_ANIM_VERT = 1 << 28
+MODEL_FLAG_ANIM_DYNAMICS = 1 << 29
+MODEL_FLAG_USES_AUTO_LODS = 1 << 30
+
+SKIN_JOINT_OFFSET_STEP = 256
+SKIN_JOINT_OFFSET_MAX = SKIN_JOINT_OFFSET_STEP * 15
+SKIN_UINT8_MAX = 255
+
+MODEL_BUILT_FLAGS_OFFSET = 0
+MODEL_BUILT_FADE_OUT_DIST_OFFSET = 24
+MODEL_BUILT_BSPHERE_OFFSET = 32
+MODEL_BUILT_AABB_EXTENTS_OFFSET = 48
+MODEL_BUILT_COMMON_MPU_OFFSET = 60
+MODEL_BUILT_VERTEX_MPU_OFFSET = 64
+MODEL_BUILT_CUSTOM_STREAM_COUNT_OFFSET = 68
+MODEL_BUILT_SUBSET_LOD_MASK_COUNT_OFFSET = 74
+MODEL_BUILT_STRAND_SUBSET_COUNT_OFFSET = 78
+
+MODEL_SUBSET_SURFACE_AREA_OFFSET = 32
+MODEL_SUBSET_UV_AREA_OFFSET = 36
+MODEL_SUBSET_FADE_OUT_DIST_OFFSET = 40
+MODEL_SUBSET_MATERIAL_LOD_DIST_OFFSET = 44
+MODEL_SUBSET_OBJ_CENTER_OFFSET = 48
+MODEL_SUBSET_OBJ_EXTENTS_OFFSET = 60
+MODEL_SUBSET_LONGEST_EDGE_OFFSET = 118
+MODEL_SUBSET_CURVATURE_RADIUS_OFFSET = 120
+MODEL_GLOBAL_BOUNDS_PADDING = 0.05
+
+ASSET_CHUNK_UNCOMPRESSED_MASK = (1 << 30) - 1
+ASSET_CHUNK_COMPRESSED_SHIFT = 30
+ASSET_CHUNK_COMPRESSION_SHIFT = 60
+ASSET_COMPRESSION_NONE = 0
+
+
+def _align(value, alignment):
+    return (int(value) + alignment - 1) & ~(alignment - 1)
+
+
+def _align_buffer(buffer, alignment):
+    pad = _align(len(buffer), alignment) - len(buffer)
+    if pad:
+        buffer += b"\x00" * pad
+
+
+def _clamp(value, lo, hi):
+    return max(lo, min(hi, value))
+
+
+def _clamp_i16(value):
+    return int(_clamp(int(round(value)), -32768, 32767))
+
+
+def _clamp_u16(value):
+    return int(_clamp(int(round(value)), 0, 65535))
+
+
+def _clamp_u8(value):
+    return int(_clamp(int(round(value)), 0, 255))
+
+
+def _vec_add(a, b):
+    return (a[0] + b[0], a[1] + b[1], a[2] + b[2])
+
+
+def _vec_sub(a, b):
+    return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
+
+
+def _vec_mul(a, s):
+    return (a[0] * s, a[1] * s, a[2] * s)
+
+
+def _vec_cross(a, b):
+    return (
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    )
+
+
+def _vec_dot(a, b):
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+
+def _vec_len(a):
+    return math.sqrt(max(0.0, _vec_dot(a, a)))
+
+
+def _vec_normalize(a, fallback=(0.0, 0.0, 1.0)):
+    length = _vec_len(a)
+    if length <= 1e-8:
+        return fallback
+    return (a[0] / length, a[1] / length, a[2] / length)
+
+
+def _blender_to_engine_vec(value):
+    return (float(value.x), float(value.z), -float(value.y))
+
+
+def _safe_matrix_relative_to_armature(arm, obj):
+    try:
+        if arm:
+            return arm.matrix_world.inverted() @ obj.matrix_world
+        return obj.matrix_world.copy()
+    except Exception:
+        return getattr(obj, "matrix_local", mathutils.Matrix.Identity(4))
+
+
+def _source_path_from_armature(arm):
+    try:
+        path = str(arm.get("engine_model_source_path", "") or "")
+    except Exception:
+        path = ""
+    return path
+
+
+def _resolve_model_armature(context):
+    arm = _resolve_anim_armature(context)
+    if arm:
+        return arm
+    active = getattr(context, "active_object", None)
+    if active and getattr(active, "type", None) == "ARMATURE":
+        return active
+    if active and getattr(active, "parent", None) and active.parent.type == "ARMATURE":
+        return active.parent
+    return None
+
+
+def _parse_u64(value, default=0):
+    if value is None:
+        return int(default) & U64_MASK
+    if isinstance(value, int):
+        return int(value) & U64_MASK
+    text = str(value).strip()
+    if not text:
+        return int(default) & U64_MASK
+    try:
+        return int(text, 0) & U64_MASK
+    except ValueError:
+        return int(default) & U64_MASK
+
+
+def _valid_material_id(index):
+    return (0x8000000000000000 | ((int(index) + 1) & 0x3FFFFFFFFFFFFFFF)) & U64_MASK
+
+
+def _normalize_material_asset_path(path):
+    text = str(path or "").strip()
+    text = re.sub(r"(?i)(\.material)\.\d{3}$", r"\1", text)
+    if text and not text.lower().endswith(".material"):
+        text = f"{text}.material"
+    return text
+
+
+class _StringPool:
+    def __init__(self, base_offset, initial_bytes):
+        self.base_offset = int(base_offset)
+        self.buffer = bytearray(initial_bytes or b"")
+        self.offsets = {}
+        self._index_existing_strings()
+
+    def _index_existing_strings(self):
+        start = 0
+        data = bytes(self.buffer)
+        while start < len(data):
+            end = data.find(b"\x00", start)
+            if end < 0:
+                break
+            if end > start:
+                try:
+                    text = data[start:end].decode("ascii")
+                except UnicodeDecodeError:
+                    text = ""
+                if text and text not in self.offsets:
+                    self.offsets[text] = self.base_offset + start
+            start = end + 1
+
+    def add(self, text):
+        text = str(text or "")
+        if text in self.offsets:
+            return self.offsets[text]
+        encoded = text.encode("ascii", errors="ignore") + b"\x00"
+        offset = self.base_offset + len(self.buffer)
+        self.buffer += encoded
+        self.offsets[text] = offset
+        return offset
+
+    def bytes(self):
+        return bytes(self.buffer)
+
+
+class _Dat1Template:
+    def __init__(self, filepath):
+        self.filepath = filepath
+        with open(filepath, "rb") as f:
+            raw = f.read()
+        dat1_offset = raw.find(b"1TAD")
+        if dat1_offset < 0:
+            raise ValueError("DAT1 magic not found")
+        self.had_stg = raw[:4] == struct.pack("<I", STG_MAGIC)
+        self.prefix = raw[:dat1_offset]
+        self.data = raw[dat1_offset:]
+        if len(self.data) < DAT1_HEADER_SIZE:
+            raise ValueError("DAT1 header is truncated")
+        data_file_id, version, declared_size, block_count, fixup_count = struct.unpack_from("<IIIHH", self.data, 0)
+        if data_file_id != DAT1_FILE_ID:
+            raise ValueError("invalid DAT1 file id")
+        if declared_size > len(self.data):
+            raise ValueError("DAT1 declared size is larger than the source file")
+        self.data = self.data[:declared_size]
+        self.version = version
+        self.block_count = block_count
+        self.fixup_count = fixup_count
+        self.sb_offset = (
+            DAT1_HEADER_SIZE
+            + block_count * DAT1_BLOCK_TABLE_ENTRY_SIZE
+            + fixup_count * DAT1_FIXUP_TABLE_ENTRY_SIZE
+        )
+        self.entries = []
+        self.blocks = {}
+        cursor = DAT1_HEADER_SIZE
+        for _index in range(block_count):
+            name_hash, block_offset, block_size = struct.unpack_from("<III", self.data, cursor)
+            self.entries.append((name_hash, block_offset, block_size))
+            self.blocks[name_hash] = (block_offset, block_size)
+            cursor += DAT1_BLOCK_TABLE_ENTRY_SIZE
+        self.fixup_table = self.data[cursor:self.sb_offset]
+        first_block = min((off for _hash, off, size in self.entries if size or off), default=len(self.data))
+        self.string_buffer = self.data[self.sb_offset:first_block]
+
+    def payload(self, block_hash):
+        off, size = self.blocks[block_hash]
+        return self.data[off:off + size]
+
+
+def _material_from_blender(mat, fallback, index, preserve_fallback_identity=False):
+    fallback = fallback or {}
+    path = str(getattr(mat, "engine_material_path", "") or "")
+    if not path:
+        mat_name = str(getattr(mat, "name", "") or "")
+        if ".material" in mat_name.lower() or "\\" in mat_name or "/" in mat_name:
+            path = mat_name
+    path = _normalize_material_asset_path(path or fallback.get("path", "") or "")
+    fallback_path = _normalize_material_asset_path(fallback.get("path", "") or "")
+    if preserve_fallback_identity and fallback_path and _material_paths_match(fallback_path, path):
+        mapping = str(fallback.get("mapping", "") or "")
+        material_id = int(fallback.get("id", 0) or 0) & U64_MASK
+        flags = int(fallback.get("flags", 0) or 0) & U32_MASK
+        mapping_hash = int(fallback.get("mapping_hash", 0)) & U32_MASK
+        path = fallback_path
+    else:
+        mapping = str(getattr(mat, "engine_material_mapping_name", "") or fallback.get("mapping", "") or "")
+        material_id = _parse_u64(getattr(mat, "get", lambda *_args: None)("engine_material_id"), fallback.get("id", 0))
+        flags = int(getattr(mat, "get", lambda *_args: 0)("engine_material_flags", fallback.get("flags", 0)) or 0) & U32_MASK
+        mapping_hash = int(fallback.get("mapping_hash", 0)) & U32_MASK
+        if mapping:
+            mapping_hash = string_crc32(mapping)
+    return {
+        "index": index,
+        "path": path,
+        "mapping": mapping,
+        "id": material_id or _valid_material_id(index),
+        "mapping_hash": mapping_hash,
+        "flags": flags,
+    }
+
+
+def _material_asset_path_from_blender(mat):
+    path = _normalize_material_asset_path(getattr(mat, "engine_material_path", "") or "")
+    if not path:
+        mat_name = str(getattr(mat, "name", "") or "")
+        if ".material" in mat_name.lower() or "\\" in mat_name or "/" in mat_name:
+            path = _normalize_material_asset_path(mat_name)
+    return path
+
+
+def _material_paths_match(left, right):
+    left = _normalize_material_asset_path(left or "")
+    right = _normalize_material_asset_path(right or "")
+    return bool(left and right and left.lower() == right.lower())
+
+
+def _primary_material_for_object(obj):
+    mesh = getattr(obj, "data", None)
+    materials = list(getattr(mesh, "materials", []) or []) if mesh else []
+    if not materials:
+        return None
+    used = {}
+    for poly in getattr(mesh, "polygons", []) or []:
+        used[int(poly.material_index)] = used.get(int(poly.material_index), 0) + 1
+    if used:
+        index = max(used.items(), key=lambda item: item[1])[0]
+        if 0 <= index < len(materials):
+            return materials[index]
+    return materials[0]
+
+
+def _set_material_index_prop(mat, material_index):
+    try:
+        mat["engine_material_index"] = int(material_index)
+    except Exception:
+        pass
+
+
+def _set_object_material_index_prop(obj, material_index):
+    try:
+        obj["engine_material_index"] = int(material_index)
+    except Exception:
+        pass
+
+
+def _build_material_entries(mesh_objects, original_materials, export_warnings=None):
+    entries = [dict(entry) for entry in original_materials]
+    if not entries:
+        entries.append({
+            "index": 0,
+            "path": "",
+            "mapping": "default",
+            "id": _valid_material_id(0),
+            "mapping_hash": string_crc32("default"),
+            "flags": 0,
+        })
+    assigned_indices = []
+    claimed_slots = {}
+    for obj in mesh_objects:
+        mat = _primary_material_for_object(obj)
+        fallback_index = int(obj.get("engine_material_index", 0) or 0)
+        if not mat:
+            assigned_index = _clamp(fallback_index, 0, len(entries) - 1)
+            assigned_indices.append(assigned_index)
+            _set_object_material_index_prop(obj, assigned_index)
+            _append_export_warning(export_warnings, f"{obj.name}: no material assigned, using source material slot {fallback_index}")
+            continue
+
+        material_index_prop = mat.get("engine_material_index")
+        material_index = None
+        try:
+            material_index = int(material_index_prop)
+        except Exception:
+            material_index = None
+        
+        path = _material_asset_path_from_blender(mat)
+        mapping = str(getattr(mat, "engine_material_mapping_name", "") or "")
+
+        if material_index is not None and material_index >= 0:
+            existing_path = entries[material_index].get("path", "") if material_index < len(entries) else ""
+            slot_is_safe = not existing_path or not path or _material_paths_match(existing_path, path)
+            if material_index in claimed_slots and claimed_slots[material_index] != mat.name:
+                slot_is_safe = False
+            if slot_is_safe:
+                while material_index >= len(entries):
+                    entries.append({
+                        "index": len(entries),
+                        "path": "",
+                        "mapping": f"material_{len(entries):03d}",
+                        "id": _valid_material_id(len(entries)),
+                        "mapping_hash": 0,
+                        "flags": 0,
+                    })
+                entries[material_index] = _material_from_blender(
+                    mat,
+                    entries[material_index],
+                    material_index,
+                    preserve_fallback_identity=bool(existing_path and path and _material_paths_match(existing_path, path)),
+                )
+                claimed_slots[material_index] = mat.name
+                _set_material_index_prop(mat, material_index)
+                _set_object_material_index_prop(obj, material_index)
+                assigned_indices.append(material_index)
+                continue
+            material_index = None
+
+        if not path:
+            _append_export_warning(export_warnings, f"{obj.name}: material '{mat.name}' has no .material path, using template/fallback data")
+        match_index = None
+        for idx, entry in enumerate(entries):
+            if path and _material_paths_match(entry.get("path", ""), path):
+                match_index = idx
+                break
+            if not path and mapping and entry.get("mapping") == mapping:
+                match_index = idx
+                break
+        if match_index is None:
+            match_index = len(entries)
+            entries.append(_material_from_blender(mat, None, match_index))
+        else:
+            entries[match_index] = _material_from_blender(
+                mat,
+                entries[match_index],
+                match_index,
+                preserve_fallback_identity=bool(path and _material_paths_match(entries[match_index].get("path", ""), path)),
+            )
+        _set_material_index_prop(mat, match_index)
+        _set_object_material_index_prop(obj, match_index)
+        assigned_indices.append(match_index)
+    return entries, assigned_indices
+
+
+def _build_material_block(material_entries, string_pool):
+    info_bytes = bytearray()
+    runtime_bytes = bytearray()
+    for entry in material_entries:
+        path_offset = string_pool.add(entry.get("path", ""))
+        mapping_offset = string_pool.add(entry.get("mapping", ""))
+        info_bytes += struct.pack("<IIII", path_offset, 0, mapping_offset, 0)
+    for index, entry in enumerate(material_entries):
+        mapping = str(entry.get("mapping", "") or "")
+        mapping_hash = string_crc32(mapping) if mapping else int(entry.get("mapping_hash", 0)) & U32_MASK
+        material_id = int(entry.get("id", 0)) & U64_MASK
+        if material_id == 0:
+            material_id = _valid_material_id(index)
+        runtime_bytes += struct.pack("<QII", material_id, mapping_hash, int(entry.get("flags", 0)) & U32_MASK)
+    return bytes(info_bytes + runtime_bytes)
+
+
+def _append_export_warning(warnings, message):
+    if warnings is None:
+        return
+    message = str(message or "").strip()
+    if message and message not in warnings:
+        warnings.append(message)
+
+
+def _format_export_warnings(warnings, limit=5):
+    shown = list(warnings[:limit])
+    if len(warnings) > limit:
+        shown.append(f"+{len(warnings) - limit} more")
+    return "; ".join(shown)
+
+
+def _uv_name_slot(name):
+    clean = re.sub(r"[^a-z0-9]", "", str(name or "").lower())
+    if clean in {"uv0", "uvmap", "map1", "texcoord0", "texturecoordinate0"}:
+        return 0
+    if clean in {"uv1", "uvmap1", "map2", "texcoord1", "texturecoordinate1"}:
+        return 1
+    if clean in {"uv2", "uvmap2", "map3", "texcoord2", "texturecoordinate2"}:
+        return 2
+    return None
+
+
+def _uv_layer_has_nonzero(layer):
+    try:
+        for item in layer.data:
+            uv = item.uv
+            if abs(float(uv.x)) > 1e-7 or abs(1.0 - float(uv.y)) > 1e-7:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _zero_uv_layer(layer):
+    try:
+        for item in layer.data:
+            item.uv = (0.0, 1.0)
+    except Exception:
+        pass
+
+
+def _uv_layers_match(left_layer, right_layer):
+    if not left_layer or not right_layer:
+        return False
+    try:
+        if len(left_layer.data) != len(right_layer.data):
+            return False
+        for left_item, right_item in zip(left_layer.data, right_layer.data):
+            left_uv = left_item.uv
+            right_uv = right_item.uv
+            if abs(float(left_uv.x) - float(right_uv.x)) > 1e-7:
+                return False
+            if abs(float(left_uv.y) - float(right_uv.y)) > 1e-7:
+                return False
+    except Exception:
+        return False
+    return True
+
+
+def _ensure_model_uv_layers(obj, warnings=None):
+    mesh = getattr(obj, "data", None)
+    uv_layers = getattr(mesh, "uv_layers", None) if mesh else None
+    result = {
+        0: {"layer": None, "source_present": False},
+        1: {"layer": None, "source_present": False},
+        2: {"layer": None, "source_present": False},
+    }
+    if uv_layers is None:
+        return result
+
+    original_layers = list(uv_layers)
+    used = []
+
+    def is_used(layer):
+        return any(layer == existing for existing in used)
+
+    def pick_named(slot):
+        for layer in original_layers:
+            if not is_used(layer) and _uv_name_slot(layer.name) == slot:
+                return layer
+        return None
+
+    for slot in range(3):
+        layer = pick_named(slot)
+        if layer is not None:
+            used.append(layer)
+            result[slot] = {"layer": layer, "source_present": True}
+
+    for slot in range(3):
+        if result[slot]["layer"] is not None:
+            continue
+        if slot < len(original_layers) and not is_used(original_layers[slot]):
+            layer = original_layers[slot]
+            used.append(layer)
+            result[slot] = {"layer": layer, "source_present": True}
+
+    for slot, info in result.items():
+        layer = info["layer"]
+        if layer is not None and layer.name != f"UV{slot}":
+            old_name = layer.name
+            layer.name = f"__LunaUV{slot}"
+            _append_export_warning(warnings, f"{obj.name}: renamed UV layer '{old_name}' to UV{slot}")
+
+    for slot, info in result.items():
+        layer = info["layer"]
+        if layer is None:
+            layer = uv_layers.new(name=f"UV{slot}")
+            _zero_uv_layer(layer)
+            result[slot] = {"layer": layer, "source_present": False}
+            _append_export_warning(warnings, f"{obj.name}: created missing UV{slot} layer")
+        layer.name = f"UV{slot}"
+
+    if not original_layers:
+        _append_export_warning(warnings, f"{obj.name}: mesh had no UV layers; created UV0-UV2 with zero values")
+    return result
+
+
+def _should_export_uv_channel(obj, uv_info, slot, original_flags):
+    flag = SUBSET_FLAG_HAS_UV1 if slot == 1 else SUBSET_FLAG_HAS_UV2
+    if original_flags & flag:
+        return True
+    layer = uv_info.get(slot, {}).get("layer")
+    prop_name = f"engine_uv{slot}_present"
+    if prop_name in obj:
+        return bool(obj.get(prop_name, False))
+    if not _uv_layer_has_nonzero(layer):
+        return False
+    uv0_layer = uv_info.get(0, {}).get("layer")
+    if uv0_layer is not None and _uv_layers_match(layer, uv0_layer):
+        return False
+    return bool(uv_info.get(slot, {}).get("source_present", False)) or True
+
+
+def _uv_layer_by_name_or_index(mesh, name, index):
+    try:
+        layer = mesh.uv_layers.get(name)
+        if layer:
+            return layer
+    except Exception:
+        pass
+    try:
+        if index < len(mesh.uv_layers):
+            return mesh.uv_layers[index]
+    except Exception:
+        pass
+    return None
+
+
+def _loop_uv(layer, loop_index):
+    if not layer:
+        return (0.0, 0.0)
+    uv = layer.data[loop_index].uv
+    return (float(uv.x), 1.0 - float(uv.y))
+
+
+def _vertex_group_joint_map(obj, arm):
+    if not arm:
+        return {}
+    bone_names = {}
+    for index, bone in enumerate(getattr(arm.data, "bones", []) or []):
+        try:
+            engine_index = int(bone.get("engine_joint_index", index))
+        except Exception:
+            engine_index = index
+        bone_names[bone.name] = engine_index
+    result = {}
+    for group in getattr(obj, "vertex_groups", []) or []:
+        if group.name in bone_names:
+            result[group.index] = bone_names[group.name]
+    return result
+
+
+def _vertex_weights(mesh_vertex, obj, group_to_joint, source_joint_count):
+    weights = []
+    if not group_to_joint:
+        return weights
+    for group_elem in getattr(mesh_vertex, "groups", []) or []:
+        joint_index = group_to_joint.get(int(group_elem.group))
+        if joint_index is None:
+            continue
+        weight = float(group_elem.weight)
+        if weight > 0.0:
+            if source_joint_count is not None and not 0 <= joint_index < source_joint_count:
+                raise ValueError(
+                    f"{obj.name}: vertex {mesh_vertex.index} uses joint {joint_index}, "
+                    f"but the source model has {source_joint_count} joints"
+                )
+            weights.append((joint_index, weight))
+    weights.sort(key=lambda item: item[1], reverse=True)
+    return weights[:12]
+
+
+def _export_mesh_vertices(obj, arm, source_joint_count, original_flags=0, export_warnings=None):
+    mesh = obj.data
+    uv_info = _ensure_model_uv_layers(obj, export_warnings)
+    mesh.calc_loop_triangles()
+    uv0_layer = _uv_layer_by_name_or_index(mesh, "UV0", 0)
+    uv1_layer = _uv_layer_by_name_or_index(mesh, "UV1", 1)
+    uv2_layer = _uv_layer_by_name_or_index(mesh, "UV2", 2)
+    has_uv1 = _should_export_uv_channel(obj, uv_info, 1, original_flags)
+    has_uv2 = _should_export_uv_channel(obj, uv_info, 2, original_flags)
+    matrix = _safe_matrix_relative_to_armature(arm, obj)
+    normal_matrix = matrix.to_3x3()
+    group_to_joint = _vertex_group_joint_map(obj, arm)
+
+    export_vertices = []
+    vertex_map = {}
+    indices = []
+
+    for triangle in mesh.loop_triangles:
+        tri_indices = []
+        for loop_index in triangle.loops:
+            loop = mesh.loops[loop_index]
+            source_vertex_index = int(loop.vertex_index)
+            uv0 = _loop_uv(uv0_layer, loop_index)
+            uv1 = _loop_uv(uv1_layer, loop_index) if has_uv1 and uv1_layer else None
+            uv2 = _loop_uv(uv2_layer, loop_index) if has_uv2 and uv2_layer else None
+            key = (
+                source_vertex_index,
+                round(uv0[0], 7), round(uv0[1], 7),
+                round((uv1 or (0.0, 0.0))[0], 7), round((uv1 or (0.0, 0.0))[1], 7),
+                round((uv2 or (0.0, 0.0))[0], 7), round((uv2 or (0.0, 0.0))[1], 7),
+                bool(uv1), bool(uv2),
+            )
+            export_index = vertex_map.get(key)
+            if export_index is None:
+                vertex = mesh.vertices[source_vertex_index]
+                co = matrix @ vertex.co
+                try:
+                    normal = normal_matrix @ vertex.normal
+                except Exception:
+                    normal = vertex.normal
+                export_index = len(export_vertices)
+                vertex_map[key] = export_index
+                export_vertices.append({
+                    "source_index": source_vertex_index,
+                    "co": _blender_to_engine_vec(co),
+                    "normal": _blender_to_engine_vec(normal),
+                    "uv0": uv0,
+                    "uv1": uv1,
+                    "uv2": uv2,
+                    "weights": _vertex_weights(vertex, obj, group_to_joint, source_joint_count),
+                })
+            tri_indices.append(export_index)
+        indices.extend(tri_indices)
+
+    return export_vertices, indices, bool(has_uv1), bool(has_uv2)
+
+
+def _split_export_vertex_chunks(vertices, indices, max_vertices=MODEL_SPLIT_VERTEX_TARGET):
+    chunks = []
+    chunk_vertices = []
+    chunk_indices = []
+    remap = {}
+    max_vertices = max(3, min(int(max_vertices), MODEL_MAX_VERTEX_COUNT))
+
+    triangles = []
+    for tri_order, tri_start in enumerate(range(0, len(indices), 3)):
+        tri = indices[tri_start:tri_start + 3]
+        if len(tri) < 3:
+            continue
+        coords = [vertices[int(index)]["co"] for index in tri]
+        centroid = (
+            (coords[0][0] + coords[1][0] + coords[2][0]) / 3.0,
+            (coords[0][1] + coords[1][1] + coords[2][1]) / 3.0,
+            (coords[0][2] + coords[1][2] + coords[2][2]) / 3.0,
+        )
+        triangles.append((-centroid[1], centroid[0], centroid[2], tri_order, tri))
+    triangles.sort()
+
+    def flush_chunk():
+        nonlocal chunk_vertices, chunk_indices, remap
+        if chunk_vertices and chunk_indices:
+            chunks.append((chunk_vertices, chunk_indices))
+        chunk_vertices = []
+        chunk_indices = []
+        remap = {}
+
+    for _height_key, _x_key, _z_key, _tri_order, tri in triangles:
+        missing = []
+        for source_index in tri:
+            if source_index not in remap and source_index not in missing:
+                missing.append(source_index)
+        if chunk_vertices and len(chunk_vertices) + len(missing) > max_vertices:
+            flush_chunk()
+
+        for source_index in tri:
+            mapped = remap.get(source_index)
+            if mapped is None:
+                mapped = len(chunk_vertices)
+                remap[source_index] = mapped
+                chunk_vertices.append(vertices[source_index])
+            chunk_indices.append(mapped)
+
+        if len(chunk_vertices) > max_vertices:
+            raise ValueError("single triangle exceeded the per-subset vertex limit")
+
+    flush_chunk()
+    return chunks
+
+
+def _uv_log_for_values(vertices, channel_name):
+    max_abs = 1.0
+    for vertex in vertices:
+        uv = vertex.get(channel_name)
+        if uv is None:
+            continue
+        max_abs = max(max_abs, abs(float(uv[0])), abs(float(uv[1])))
+    unbounded = int(round(max_abs * MODEL_UV_FLOAT_TO_FIXED_BASE)) >> 15
+    return _clamp(unbounded.bit_length() if unbounded > 0 else 0, 0, 15)
+
+
+def _uv_scale(log_value):
+    return float(1 << int(log_value)) / MODEL_UV_FLOAT_TO_FIXED_BASE
+
+
+def _pack_uv(uv, log_value):
+    scale = _uv_scale(log_value)
+    return (
+        _clamp_i16(float(uv[0]) / scale),
+        _clamp_i16(float(uv[1]) / scale),
+    )
+
+
+def _pack_normal_tangent(normal):
+    n = _vec_normalize(normal)
+    inv = 1.0 / math.sqrt(max(1e-6, abs(n[2]) * 4.0 + 4.0))
+    nx = _clamp(round((n[0] * inv + 0.5) * 1023.0), 0, 1023)
+    ny = _clamp(round((n[1] * inv + 0.5) * 1023.0), 0, 1023)
+    tx = 1023
+    alpha = 2 if n[2] >= 0.0 else 0
+    return int(nx) | (int(ny) << 10) | (int(tx) << 20) | (int(alpha) << 30)
+
+
+def _normalize_skin_weights(weights):
+    if not weights:
+        return [(0, 256)]
+    weights = weights[:12]
+    total = sum(max(0.0, weight) for _joint, weight in weights)
+    if total <= 1e-8:
+        return [(int(weights[0][0]), 256)]
+    scaled = []
+    running = 0
+    for joint, weight in weights:
+        exact = max(0.0, weight) * 256.0 / total
+        base = int(math.floor(exact))
+        scaled.append([int(joint), base, exact - base])
+        running += base
+    remainder = 256 - running
+    scaled.sort(key=lambda item: item[2], reverse=True)
+    for index in range(abs(remainder)):
+        scaled[index % len(scaled)][1] += 1 if remainder > 0 else -1
+    scaled.sort(key=lambda item: item[1], reverse=True)
+    result = [(joint, _clamp(weight, 0, 256)) for joint, weight, _frac in scaled if weight > 0]
+    return result or [(int(weights[0][0]), 256)]
+
+
+def _skin_joint_entries(weights):
+    entries = [(int(joint), int(weight)) for joint, weight in weights if int(weight) > 0]
+    return entries or [(int(weights[0][0]) if weights else 0, 256)]
+
+
+def _split_full_influence_joints(joints, is_16bit, cluster_joint_count):
+    if cluster_joint_count > 1 and len(joints) >= 1 and joints[0][1] == 256:
+        joint_index = joints[0][0]
+        joints[0] = (joint_index, 128)
+        joints.insert(1, (joint_index if is_16bit else 0, 128))
+        return True
+    return False
+
+
+def _insert_bridge_indices(joints, joint_count_max):
+    joint_count = len(joints)
+    index = 0
+    while index < joint_count:
+        joint_index, weight = joints[index]
+        if joint_index <= SKIN_UINT8_MAX:
+            index += 1
+            continue
+        joints.insert(index + 1, (joint_index - SKIN_UINT8_MAX, weight))
+        joints[index] = (SKIN_UINT8_MAX, 0)
+        joint_count += 1
+        if joint_count >= joint_count_max:
+            break
+        index += 1
+
+
+def _prepare_cluster_skin(normalized_weights):
+    cluster_vertex_count = len(normalized_weights)
+    source_joints = [_skin_joint_entries(weights) for weights in normalized_weights]
+
+    joint_min = None
+    joint_count_max = 1
+    for joints in source_joints:
+        for joint_index, weight in joints:
+            if weight > 0:
+                joint_min = joint_index if joint_min is None else min(joint_min, joint_index)
+        joint_count_max = max(joint_count_max, len(joints))
+    if joint_min is None:
+        joint_min = 0
+    joint_offset = min((joint_min // SKIN_JOINT_OFFSET_STEP) * SKIN_JOINT_OFFSET_STEP, SKIN_JOINT_OFFSET_MAX)
+    if joint_count_max == 0 or joint_count_max > 12:
+        raise ValueError("skin cluster influence count is out of range")
+
+    prepared = []
+    is_16bit = False
+    for joints in source_joints:
+        working = [(joint_index - joint_offset, weight) for joint_index, weight in joints]
+        working.sort(key=lambda item: item[0])
+        if working[0][0] > SKIN_UINT8_MAX:
+            is_16bit = True
+            break
+
+        incremental = list(working)
+        for index in range(len(incremental) - 1, 0, -1):
+            incremental[index] = (incremental[index][0] - incremental[index - 1][0], incremental[index][1])
+
+        if len(incremental) < joint_count_max:
+            _insert_bridge_indices(incremental, joint_count_max)
+
+        if any(joint_index > SKIN_UINT8_MAX for joint_index, _weight in incremental):
+            is_16bit = True
+            break
+        prepared.append(incremental)
+
+    if is_16bit:
+        joint_offset = 0
+        prepared = []
+        for joints in source_joints:
+            absolute = sorted(joints, key=lambda item: item[0])
+            prepared.append(list(absolute))
+        if joint_count_max > 2:
+            joint_count_max = min(12, _align(joint_count_max, 4))
+
+    for index, joints in enumerate(prepared):
+        _split_full_influence_joints(joints, is_16bit, joint_count_max)
+        while len(joints) < joint_count_max:
+            joints.append((0, 0))
+        prepared[index] = joints[:joint_count_max]
+
+    return is_16bit, joint_offset, joint_count_max, prepared[:cluster_vertex_count]
+
+
+def _serialize_cluster_skin_data(prepared, is_16bit, joint_count_max):
+    cluster_bytes = bytearray()
+    for joints in prepared:
+        for joint_index, weight in joints[:joint_count_max]:
+            if is_16bit:
+                cluster_bytes += struct.pack("<H", int(joint_index) & 0xFFFF)
+                if joint_count_max > 1:
+                    cluster_bytes += struct.pack("<B", int(weight) & 0xFF)
+            else:
+                cluster_bytes += struct.pack("<B", int(joint_index) & 0xFF)
+                if joint_count_max > 1:
+                    cluster_bytes += struct.pack("<B", int(weight) & 0xFF)
+    pad = (-len(cluster_bytes)) & 3
+    if pad:
+        cluster_bytes += b"\x00" * pad
+    return bytes(cluster_bytes)
+
+
+def _build_skin_sections(vertices, force_skin):
+    if not force_skin:
+        return b"", b""
+    skin_data = bytearray()
+    cluster_headers = bytearray()
+    for cluster_start in range(0, len(vertices), SKIN_CLUSTER_VERTEX_COUNT):
+        cluster_vertices = vertices[cluster_start:cluster_start + SKIN_CLUSTER_VERTEX_COUNT]
+        normalized_weights = [_normalize_skin_weights(vertex.get("weights", [])) for vertex in cluster_vertices]
+        influence_count = max(1, min(12, max(len(weights) for weights in normalized_weights)))
+
+        if influence_count > 1:
+            normalized_weights = [
+                [(weights[0][0], 128), (weights[0][0], 128)]
+                if len(weights) == 1 and weights[0][1] == 256 else weights
+                for weights in normalized_weights
+            ]
+            influence_count = max(2, min(12, max(len(weights) for weights in normalized_weights)))
+
+        is_16bit, joint_offset, joint_count_max, prepared = _prepare_cluster_skin(normalized_weights)
+
+        _align_buffer(skin_data, SKIN_CLUSTER_WORD_BYTES)
+        data_offset4 = len(skin_data) // SKIN_CLUSTER_WORD_BYTES
+        if data_offset4 > SKIN_CLUSTER_OFFSET_MASK:
+            raise ValueError("skin stream is too large for ModelSubset cluster offsets")
+        header = data_offset4 | ((joint_count_max - 1) << SKIN_CLUSTER_INFLUENCE_SHIFT)
+        if is_16bit:
+            header |= SKIN_CLUSTER_FULL_INDEX_BIT
+        else:
+            header |= (joint_offset // SKIN_JOINT_OFFSET_STEP) << SKIN_CLUSTER_JOINT_OFFSET_SHIFT
+        cluster_headers += struct.pack("<I", header)
+        skin_data += _serialize_cluster_skin_data(prepared, is_16bit, joint_count_max)
+    return bytes(skin_data), bytes(cluster_headers)
+
+
+def _triangle_area(a, b, c):
+    return 0.5 * _vec_len(_vec_cross(_vec_sub(b, a), _vec_sub(c, a)))
+
+
+def _triangle_uv_area(a, b, c):
+    return abs(
+        (b[0] - a[0]) * (c[1] - a[1])
+        - (b[1] - a[1]) * (c[0] - a[0])
+    ) * 0.5
+
+
+def _fit_subset_mpu(vertices, requested_mpu):
+    coords = [vertex["co"] for vertex in vertices]
+    mins = [min(coord[axis] for coord in coords) for axis in range(3)]
+    maxs = [max(coord[axis] for coord in coords) for axis in range(3)]
+    center = [(mins[axis] + maxs[axis]) * 0.5 for axis in range(3)]
+    extents = [(maxs[axis] - mins[axis]) * 0.5 for axis in range(3)]
+    radius = max((_vec_len(_vec_sub(coord, center)) for coord in coords), default=0.0)
+    residual_limit = 32767 - (1 << (SUBSET_CENTER_LOG_SCALE - 1))
+    required_mpu = max(float(requested_mpu), 1e-12)
+    for axis in range(3):
+        required_mpu = max(
+            required_mpu,
+            extents[axis] / float(residual_limit),
+            abs(center[axis]) / float(32767 * (1 << SUBSET_CENTER_LOG_SCALE)),
+            extents[axis] / float(255 * (1 << SUBSET_CENTER_LOG_SCALE)),
+        )
+    required_mpu = max(
+        required_mpu,
+        radius / float(255 * (2 << SUBSET_CENTER_LOG_SCALE)),
+    )
+    return math.nextafter(required_mpu, math.inf)
+
+
+def _subset_bounds(vertices, mpu):
+    coords = [vertex["co"] for vertex in vertices]
+    mins = [min(coord[axis] for coord in coords) for axis in range(3)]
+    maxs = [max(coord[axis] for coord in coords) for axis in range(3)]
+    center = tuple((mins[axis] + maxs[axis]) * 0.5 for axis in range(3))
+    extents = tuple((maxs[axis] - mins[axis]) * 0.5 for axis in range(3))
+    radius = max((_vec_len(_vec_sub(coord, center)) for coord in coords), default=0.0)
+
+    units = [
+        [int(round(coord[axis] / mpu)) for coord in coords]
+        for axis in range(3)
+    ]
+    needs_origin = any(
+        min(units[axis]) < -32768 or max(units[axis]) > 32767
+        for axis in range(3)
+    )
+    origin_packed = [
+        _clamp_i16(center[axis] / (mpu * float(1 << SUBSET_CENTER_LOG_SCALE)))
+        for axis in range(3)
+    ]
+    origin_units = [
+        packed << SUBSET_CENTER_LOG_SCALE if needs_origin else 0
+        for packed in origin_packed
+    ]
+
+    extents_packed = (
+        int(_clamp(math.ceil(extents[0] / (mpu * float(1 << SUBSET_CENTER_LOG_SCALE))), 0, 255)),
+        int(_clamp(math.ceil(extents[1] / (mpu * float(1 << SUBSET_CENTER_LOG_SCALE))), 0, 255)),
+        int(_clamp(math.ceil(extents[2] / (mpu * float(1 << SUBSET_CENTER_LOG_SCALE))), 0, 255)),
+        int(_clamp(math.ceil(radius / (mpu * float(2 << SUBSET_CENTER_LOG_SCALE))), 0, 255)),
+    )
+    extents_word = (
+        extents_packed[0]
+        | (extents_packed[1] << 8)
+        | (extents_packed[2] << 16)
+        | (extents_packed[3] << 24)
+    )
+    return center, extents, radius, origin_units, origin_packed, extents_word, needs_origin
+
+
+def _build_subset_geometry_from_data(obj, arm, material_index, original_record, custom_stream_index, vertices, indices, has_uv1, has_uv2):
+    original_flags = 0
+    if original_record:
+        original_flags = struct.unpack_from("<H", original_record, MODEL_SUBSET_FLAGS_OFFSET)[0]
+    if len(vertices) > MODEL_MAX_VERTEX_COUNT:
+        raise ValueError(f"{obj.name}: {len(vertices)} vertices exceeds the per-subset 65535 vertex limit")
+    if any(index >= MODEL_MAX_VERTEX_COUNT for index in indices):
+        raise ValueError(f"{obj.name}: triangle index exceeds the 16-bit engine index limit")
+
+    mpu = float(obj.get("engine_mpu", arm.get("engine_mpu", MODEL_DEFAULT_MPU) if arm else MODEL_DEFAULT_MPU) or MODEL_DEFAULT_MPU)
+    if mpu <= 0.0:
+        mpu = MODEL_DEFAULT_MPU
+    mpu = _fit_subset_mpu(vertices, mpu)
+
+    uv0_log = _uv_log_for_values(vertices, "uv0")
+    uv1_log = _uv_log_for_values(vertices, "uv1") if has_uv1 else 0
+    uv2_log = _uv_log_for_values(vertices, "uv2") if has_uv2 else 0
+    uv_log_scales = int(uv0_log) | (int(uv1_log) << 4) | (int(uv2_log) << 8)
+
+    center, extents, radius, origin_units, origin_packed, extents_word, needs_origin = _subset_bounds(vertices, mpu)
+
+    std_vertices = bytearray()
+    for vertex in vertices:
+        co = vertex["co"]
+        packed_pos = (
+            int(_clamp(int(round(co[0] / mpu)) - origin_units[0], -32768, 32767)),
+            int(_clamp(int(round(co[1] / mpu)) - origin_units[1], -32768, 32767)),
+            int(_clamp(int(round(co[2] / mpu)) - origin_units[2], -32768, 32767)),
+        )
+        normal_tangent = _pack_normal_tangent(vertex.get("normal", (0.0, 0.0, 1.0)))
+        uv0 = _pack_uv(vertex.get("uv0", (0.0, 0.0)), uv0_log)
+        std_vertices += struct.pack(
+            "<hhhhIhh",
+            packed_pos[0],
+            packed_pos[1],
+            packed_pos[2],
+            (16 << 10) | 512,
+            normal_tangent,
+            uv0[0],
+            uv0[1],
+        )
+
+    geom = bytearray()
+    vertex_std_offset = 0
+    geom += std_vertices
+
+    vertex_uv12_offset = 0
+    if has_uv1 or has_uv2:
+        _align_buffer(geom, 4)
+        vertex_uv12_offset = len(geom)
+        for vertex in vertices:
+            if has_uv1:
+                geom += struct.pack("<hh", *_pack_uv(vertex.get("uv1") or (0.0, 0.0), uv1_log))
+            if has_uv2:
+                geom += struct.pack("<hh", *_pack_uv(vertex.get("uv2") or (0.0, 0.0), uv2_log))
+
+    _align_buffer(geom, 2)
+    index_data_offset = len(geom)
+    geom += struct.pack(f"<{len(indices)}H", *[int(index) & 0xFFFF for index in indices])
+
+    force_skin = bool(original_flags & SUBSET_FLAG_SKINNED) or any(vertex.get("weights") for vertex in vertices)
+    if force_skin:
+        for vertex in vertices:
+            if not vertex.get("weights"):
+                vertex["weights"] = [(0, 1.0)]
+    skin_data, cluster_headers = _build_skin_sections(vertices, force_skin)
+    vertex_skin_offset = 0
+    skin_cluster_offset = 0
+    if force_skin:
+        _align_buffer(geom, SKIN_CLUSTER_WORD_BYTES)
+        vertex_skin_offset = len(geom)
+        geom += skin_data
+        _align_buffer(geom, SKIN_CLUSTER_WORD_BYTES)
+        skin_cluster_offset = len(geom)
+        geom += cluster_headers
+
+    surface_area = 0.0
+    uv_area = 0.0
+    longest_edge = 0.0
+    for i in range(0, len(indices), 3):
+        a = vertices[indices[i]]
+        b = vertices[indices[i + 1]]
+        c = vertices[indices[i + 2]]
+        surface_area += _triangle_area(a["co"], b["co"], c["co"])
+        uv_area += _triangle_uv_area(a.get("uv0", (0.0, 0.0)), b.get("uv0", (0.0, 0.0)), c.get("uv0", (0.0, 0.0)))
+        longest_edge = max(
+            longest_edge,
+            _vec_len(_vec_sub(a["co"], b["co"])),
+            _vec_len(_vec_sub(b["co"], c["co"])),
+            _vec_len(_vec_sub(c["co"], a["co"])),
+        )
+
+    record = bytearray(original_record if original_record else b"\x00" * MODEL_SUBSET_RECORD_SIZE)
+    if len(record) < MODEL_SUBSET_RECORD_SIZE:
+        record += b"\x00" * (MODEL_SUBSET_RECORD_SIZE - len(record))
+    flags = (original_flags & ~SUBSET_EXPORT_FLAG_CLEAR_MASK)
+    if force_skin:
+        flags |= SUBSET_FLAG_SKINNED
+    if has_uv1:
+        flags |= SUBSET_FLAG_HAS_UV1
+    if has_uv2:
+        flags |= SUBSET_FLAG_HAS_UV2
+    if needs_origin:
+        flags |= SUBSET_FLAG_HAS_ORIGIN_OFFSET
+
+    struct.pack_into("<I", record, MODEL_SUBSET_INDEX_COUNT_OFFSET, len(indices))
+    struct.pack_into("<I", record, MODEL_SUBSET_VERTEX_COUNT_OFFSET, len(vertices))
+    struct.pack_into("<I", record, 8, 0)
+    struct.pack_into("<I", record, MODEL_SUBSET_INDEX_DATA_OFFSET, index_data_offset)
+    struct.pack_into("<I", record, 16, 0x0000FFFF)
+    struct.pack_into("<H", record, MODEL_SUBSET_FLAGS_OFFSET, flags)
+    struct.pack_into("<H", record, MODEL_SUBSET_UV_LOG_OFFSET, uv_log_scales)
+    struct.pack_into("<f", record, MODEL_SUBSET_MPU_OFFSET, mpu)
+    struct.pack_into("<H", record, MODEL_SUBSET_MATERIAL_INDEX_OFFSET, int(material_index) & 0xFFFF)
+    if original_record:
+        try:
+            original_index_count, original_vertex_count = struct.unpack_from("<II", original_record, 0)
+        except Exception:
+            original_index_count = original_vertex_count = -1
+        if original_index_count == len(indices) and original_vertex_count == len(vertices):
+            surface_area, uv_area = struct.unpack_from("<ff", original_record, MODEL_SUBSET_SURFACE_AREA_OFFSET)
+            longest_edge = float(struct.unpack_from("<H", original_record, MODEL_SUBSET_LONGEST_EDGE_OFFSET)[0]) * mpu
+
+    struct.pack_into("<f", record, MODEL_SUBSET_SURFACE_AREA_OFFSET, float(surface_area))
+    struct.pack_into("<f", record, MODEL_SUBSET_UV_AREA_OFFSET, float(uv_area))
+    struct.pack_into("<f", record, MODEL_SUBSET_FADE_OUT_DIST_OFFSET, 0.0)
+    struct.pack_into("<iii", record, MODEL_SUBSET_OBJ_CENTER_OFFSET, int(origin_packed[0]), int(origin_packed[1]), int(origin_packed[2]))
+    struct.pack_into("<I", record, MODEL_SUBSET_OBJ_EXTENTS_OFFSET, extents_word)
+    struct.pack_into("<I", record, MODEL_SUBSET_VERTEX_STD_OFFSET, vertex_std_offset)
+    struct.pack_into("<I", record, MODEL_SUBSET_VERTEX_UV12_OFFSET, vertex_uv12_offset)
+    struct.pack_into("<I", record, 72, 0)
+    struct.pack_into("<I", record, 76, vertex_skin_offset)
+    struct.pack_into("<I", record, 80, skin_cluster_offset)
+    struct.pack_into("<I", record, 84, custom_stream_index)
+    struct.pack_into("<I", record, MODEL_SUBSET_BASE_OFFSET, 0)
+    struct.pack_into("<I", record, 92, len(geom))
+    struct.pack_into("<I", record, 96, 0)
+    struct.pack_into("<H", record, 100, 0)
+    struct.pack_into("<H", record, 102, 1)
+    struct.pack_into("<H", record, MODEL_SUBSET_LONGEST_EDGE_OFFSET, _clamp_u16(longest_edge / max(mpu, 1e-9)))
+
+    stats = {
+        "vertex_count": len(vertices),
+        "index_count": len(indices),
+        "custom_stream_count": len(vertices),
+        "skinned": force_skin,
+        "center": center,
+        "extents": extents,
+        "radius": radius,
+        "mpu": mpu,
+    }
+    return bytes(record), bytes(geom), stats
+
+
+def _build_subset_geometry_chunks(obj, arm, material_index, original_record, source_joint_count, export_warnings=None):
+    original_flags = 0
+    if original_record:
+        original_flags = struct.unpack_from("<H", original_record, MODEL_SUBSET_FLAGS_OFFSET)[0]
+
+    vertices, indices, has_uv1, has_uv2 = _export_mesh_vertices(
+        obj,
+        arm,
+        source_joint_count,
+        original_flags=original_flags,
+        export_warnings=export_warnings,
+    )
+    if not vertices or not indices:
+        raise ValueError(f"{obj.name}: mesh has no triangles to export")
+    if len(vertices) > MODEL_MAX_VERTEX_COUNT or any(index >= MODEL_MAX_VERTEX_COUNT for index in indices):
+        raise ValueError(
+            f"{obj.name}: {len(vertices)} export vertices exceeds the engine per-subset limit of "
+            f"{MODEL_MAX_VERTEX_COUNT}. Please split this mesh into smaller submeshes before export. "
+            "Automatic bigger-submesh splitting may be added later."
+        )
+    return [(vertices, indices, has_uv1, has_uv2)]
+
+
+def _build_geometry_and_subset_blocks(mesh_objects, arm, material_indices, template, source_joint_count, export_warnings=None):
+    subset_block_hash = BLOCK_HASHES["ModelSubset"]
+    original_subset_block = template.payload(subset_block_hash) if subset_block_hash in template.blocks else b""
+    original_count = len(original_subset_block) // MODEL_SUBSET_RECORD_SIZE
+
+    subset_records = []
+    geom_buffer = bytearray()
+    stats = []
+    subset_index_map = {}
+    custom_stream_index = 0
+    for index, obj in enumerate(mesh_objects):
+        original_record = b""
+        try:
+            old_index_value = obj.get("engine_subset_index", index)
+            old_index = int(index if old_index_value is None else old_index_value)
+        except Exception:
+            old_index = index
+        if 0 <= old_index < original_count:
+            start = old_index * MODEL_SUBSET_RECORD_SIZE
+            original_record = original_subset_block[start:start + MODEL_SUBSET_RECORD_SIZE]
+
+        chunks = _build_subset_geometry_chunks(
+            obj,
+            arm,
+            material_indices[index],
+            original_record,
+            source_joint_count,
+            export_warnings=export_warnings,
+        )
+        mapped_indices = []
+        for chunk_vertices, chunk_indices, has_uv1, has_uv2 in chunks:
+            _align_buffer(geom_buffer, DAT1_BLOCK_ALIGN)
+            geom_base = len(geom_buffer)
+            record, geom, subset_stats = _build_subset_geometry_from_data(
+                obj,
+                arm,
+                material_indices[index],
+                original_record,
+                custom_stream_index,
+                chunk_vertices,
+                chunk_indices,
+                has_uv1,
+                has_uv2,
+            )
+            record = bytearray(record)
+            struct.pack_into("<I", record, MODEL_SUBSET_BASE_OFFSET, geom_base)
+            geom_buffer += geom
+            mapped_indices.append(len(subset_records))
+            subset_records.append(bytes(record))
+            stats.append(subset_stats)
+            custom_stream_index += _align(subset_stats["custom_stream_count"], 2)
+        subset_index_map[int(old_index)] = mapped_indices
+    return b"".join(subset_records), bytes(geom_buffer), stats, subset_index_map
+
+
+def _json_list_from_idprop(owner, key):
+    try:
+        data = json.loads(str(owner.get(key, "[]") or "[]"))
+    except Exception:
+        return []
+    return data if isinstance(data, list) else []
+
+
+def _mapped_subset_ids(source_ids, subset_index_map, subset_count, allow_direct=False):
+    result = []
+    for value in source_ids:
+        try:
+            source_id = int(value)
+        except Exception:
+            continue
+        mapped = subset_index_map.get(source_id)
+        if mapped is None and allow_direct and 0 <= source_id < subset_count:
+            mapped = source_id
+        if mapped is None:
+            continue
+        mapped_values = mapped if isinstance(mapped, (list, tuple, set)) else [mapped]
+        for mapped_value in mapped_values:
+            try:
+                mapped_index = int(mapped_value)
+            except Exception:
+                continue
+            if 0 <= mapped_index < subset_count and mapped_index not in result:
+                result.append(mapped_index)
+    return result
+
+
+def _build_look_group_block(groups, look_count, string_pool):
+    if not groups:
+        groups = [{
+            "name": "default",
+            "name_hash": string_crc32("default"),
+            "look_indices": list(range(look_count)),
+        }]
+
+    records = bytearray()
+    indices = bytearray()
+    records_base = 1
+    indices_base = len(groups) * MODEL_LOOK_GROUP_SIZE
+    for group_index, group in enumerate(groups):
+        raw_indices = group.get("look_indices", [])
+        look_indices = []
+        for value in raw_indices:
+            try:
+                look_index = int(value)
+            except Exception:
+                continue
+            if 0 <= look_index < look_count and look_index not in look_indices:
+                look_indices.append(look_index)
+
+        name = str(group.get("name", "") or f"Look Group {group_index}")
+        name_hash = int(group.get("name_hash", 0) or 0) & U32_MASK
+        if not name_hash:
+            name_hash = string_crc32(name)
+        name_offset = string_pool.add(name)
+        indices_offset = indices_base + len(indices)
+        records += struct.pack("<QH6sII", indices_offset, len(look_indices), b"\x00" * 6, name_hash, name_offset)
+        if look_indices:
+            indices += struct.pack(f"<{len(look_indices)}H", *look_indices)
+
+    return bytes(struct.pack("<B", len(groups)) + records + indices)
+
+
+def _build_look_blocks(subset_count, string_pool, template, arm=None, subset_index_map=None):
+    look_name = "default"
+    look_name_offset = string_pool.add(look_name)
+    look_hash = string_crc32(look_name)
+
+    original_look = template.payload(BLOCK_HASHES["ModelLook"])
+    original_look_built = template.payload(BLOCK_HASHES["ModelLookBuilt"])
+    original_subset_block = template.payload(BLOCK_HASHES["ModelSubset"]) if BLOCK_HASHES["ModelSubset"] in template.blocks else b""
+    source_subset_count = len(original_subset_block) // MODEL_SUBSET_RECORD_SIZE
+    source_look_count = max(1, len(original_look) // MODEL_LOOK_SIZE)
+    source_built_look_count = len(original_look_built) // MODEL_LOOK_BUILT_SIZE
+    subset_index_map = subset_index_map or {}
+    use_custom_looks = bool(arm and arm.get("engine_model_looks_modified", False))
+    custom_looks = _json_list_from_idprop(arm, "engine_model_looks_json") if use_custom_looks else []
+    custom_groups = _json_list_from_idprop(arm, "engine_model_look_groups_json") if use_custom_looks else []
+
+    def source_look_index(value, fallback=0):
+        try:
+            index = int(value)
+        except Exception:
+            index = fallback
+        if 0 <= index < source_built_look_count:
+            return index
+        return 0 if source_built_look_count else -1
+
+    def source_look_header(index):
+        index = source_look_index(index)
+        if index < 0:
+            return None
+        offset = index * MODEL_LOOK_BUILT_SIZE
+        if offset + MODEL_LOOK_BUILT_SIZE > len(original_look_built):
+            return None
+        offsets = list(struct.unpack_from("<7Q", original_look_built, offset))
+        counts = list(struct.unpack_from("<6H", original_look_built, offset + 56))
+        hashes = struct.unpack_from("<3I", original_look_built, offset + 68)
+        return offsets, counts, hashes
+
+    def source_look_section_size(index, section):
+        header = source_look_header(index)
+        if not header:
+            return 0
+        offsets, counts, _hashes = header
+        data_offset = int(offsets[section])
+        if data_offset < 0 or data_offset >= len(original_look_built):
+            return 0
+        if section < 6:
+            return max(0, int(counts[section]) * 2)
+        candidates = [len(original_look_built)]
+        for source_index in range(source_built_look_count):
+            other = source_look_header(source_index)
+            if not other:
+                continue
+            for other_offset in other[0]:
+                other_offset = int(other_offset)
+                if data_offset < other_offset <= len(original_look_built):
+                    candidates.append(other_offset)
+        return max(0, min(candidates) - data_offset)
+
+    def source_look_section(index, section):
+        header = source_look_header(index)
+        if not header:
+            return b"", 0
+        offsets, counts, _hashes = header
+        data_offset = int(offsets[section])
+        size = source_look_section_size(index, section)
+        if size <= 0 or data_offset < 0 or data_offset + size > len(original_look_built):
+            return b"", 0
+        count = int(counts[section]) if section < 6 else 0
+        return bytes(original_look_built[data_offset:data_offset + size]), count
+
+    look_defs = []
+    if custom_looks:
+        for look_index, look_info in enumerate(custom_looks):
+            mapped_ids = _mapped_subset_ids(look_info.get("subset_ids", []), subset_index_map, subset_count, allow_direct=True)
+            name = str(look_info.get("name", "") or f"Look {look_index}")
+            name_hash = int(look_info.get("name_hash", 0) or 0) & U32_MASK
+            if not name_hash:
+                name_hash = string_crc32(name)
+            look_defs.append({
+                "ids": mapped_ids,
+                "name": name,
+                "hash": name_hash,
+                "offset": string_pool.add(name),
+                "source_index": source_look_index(look_info.get("index", look_index), look_index),
+            })
+    if not look_defs:
+        for look_index in range(source_look_count):
+            original_offset = look_index * MODEL_LOOK_BUILT_SIZE
+            mapped_ids = []
+            if original_offset + MODEL_LOOK_BUILT_SIZE <= len(original_look_built):
+                subset_ids_offset = struct.unpack_from("<Q", original_look_built, original_offset)[0]
+                subset_id_count = struct.unpack_from("<H", original_look_built, original_offset + 56)[0]
+                original_name_hash, _original_name_hash_lower, original_name_offset = struct.unpack_from(
+                    "<3I", original_look_built, original_offset + 68
+                )
+                ids_start = int(subset_ids_offset)
+                ids_end = ids_start + int(subset_id_count) * 2
+                if 0 <= ids_start <= ids_end <= len(original_look_built) and subset_id_count:
+                    source_ids = list(struct.unpack_from(f"<{int(subset_id_count)}H", original_look_built, ids_start))
+                    mapped_ids = _mapped_subset_ids(source_ids, subset_index_map, subset_count)
+            else:
+                original_name_hash = look_hash
+                original_name_offset = look_name_offset
+            if not mapped_ids and look_index == 0:
+                mapped_ids = [index for index in range(min(source_subset_count, subset_count))]
+            look_defs.append({
+                "ids": mapped_ids,
+                "name": f"Look {look_index}",
+                "hash": original_name_hash,
+                "offset": original_name_offset,
+                "source_index": source_look_index(look_index, look_index),
+            })
+    look_count = max(1, len(look_defs))
+
+    look = bytearray()
+    for look_index, look_def in enumerate(look_defs):
+        ids = look_def["ids"]
+        source_index = int(look_def.get("source_index", look_index))
+        source_offset = source_index * MODEL_LOOK_SIZE
+        if 0 <= source_offset and source_offset + MODEL_LOOK_SIZE <= len(original_look):
+            record = bytearray(original_look[source_offset:source_offset + MODEL_LOOK_SIZE])
+        else:
+            record = bytearray(b"\x00" * MODEL_LOOK_SIZE)
+        for lod_index in range(8):
+            struct.pack_into("<HH", record, lod_index * 4, 0, len(ids))
+        look += record
+
+    look_built_headers = bytearray()
+    headers_size = look_count * MODEL_LOOK_BUILT_SIZE
+    look_built_data = bytearray()
+    for look_index, look_def in enumerate(look_defs):
+        ids = look_def["ids"]
+        source_index = int(look_def.get("source_index", look_index))
+        section_offsets = []
+        section_counts = []
+
+        section_offsets.append(headers_size + len(look_built_data))
+        section_counts.append(len(ids))
+        if ids:
+            look_built_data += struct.pack(f"<{len(ids)}H", *ids)
+
+        for section in range(1, 7):
+            chunk, count = source_look_section(source_index, section)
+            if (not chunk or (section == 5 and count == 0)) and source_index != 0:
+                chunk, count = source_look_section(0, section)
+            section_offsets.append(headers_size + len(look_built_data))
+            if section < 6:
+                section_counts.append(count)
+            if chunk:
+                look_built_data += chunk
+
+        name_hash = int(look_def.get("hash", look_hash)) & U32_MASK
+        name_offset = int(look_def.get("offset", look_name_offset))
+        look_built_headers += struct.pack(
+            "<7Q6H3I",
+            section_offsets[0],
+            section_offsets[1],
+            section_offsets[2],
+            section_offsets[3],
+            section_offsets[4],
+            section_offsets[5],
+            section_offsets[6],
+            section_counts[0],
+            section_counts[1],
+            section_counts[2],
+            section_counts[3],
+            section_counts[4],
+            section_counts[5],
+            name_hash,
+            name_hash,
+            name_offset,
+        )
+
+    if custom_looks:
+        look_group = _build_look_group_block(custom_groups, look_count, string_pool)
+    else:
+        look_group = template.payload(BLOCK_HASHES["ModelLookGroup"])
+    if not look_group:
+        look_group = bytearray()
+        look_group += struct.pack("<B", 1)
+        look_group += struct.pack("<QH6sII", MODEL_LOOK_GROUP_SIZE, look_count, b"\x00" * 6, look_hash, look_name_offset)
+        look_group += struct.pack(f"<{look_count}H", *range(look_count))
+    return bytes(look), bytes(look_built_headers + look_built_data), bytes(look_group)
+
+
+def _valid_model_bounds(bsphere, aabb):
+    return (
+        bsphere is not None
+        and aabb is not None
+        and len(bsphere) == 4
+        and len(aabb) == 3
+        and all(math.isfinite(float(v)) for v in tuple(bsphere) + tuple(aabb))
+        and float(bsphere[3]) > 0.0
+        and all(float(v) >= 0.0 for v in aabb)
+    )
+
+
+def _float_list_from_json_prop(owner, key, count):
+    if owner is None:
+        return None
+    raw = owner.get(key)
+    if raw is None:
+        return None
+    try:
+        values = json.loads(raw) if isinstance(raw, str) else list(raw)
+    except Exception:
+        return None
+    if len(values) != count:
+        return None
+    try:
+        values = tuple(float(v) for v in values)
+    except Exception:
+        return None
+    if not all(math.isfinite(v) for v in values):
+        return None
+    return values
+
+
+def _positive_float_prop(owner, key):
+    if owner is None:
+        return None
+    try:
+        value = float(owner.get(key))
+    except Exception:
+        return None
+    if math.isfinite(value) and value > 0.0:
+        return value
+    return None
+
+
+def _source_model_built_state(model_built, arm=None):
+    bsphere = _float_list_from_json_prop(arm, "engine_model_source_bsphere_json", 4)
+    aabb = _float_list_from_json_prop(arm, "engine_model_source_aabb_json", 3)
+    source_bounds = (bsphere[:3], aabb, bsphere[3]) if _valid_model_bounds(bsphere, aabb) else None
+    source_common_mpu = _positive_float_prop(arm, "engine_model_source_common_mpu")
+    source_vertex_mpu = _positive_float_prop(arm, "engine_model_source_vertex_mpu")
+
+    try:
+        if source_bounds is None:
+            block_bsphere = struct.unpack_from("<4f", model_built, MODEL_BUILT_BSPHERE_OFFSET)
+            block_aabb = struct.unpack_from("<3f", model_built, MODEL_BUILT_AABB_EXTENTS_OFFSET)
+            if _valid_model_bounds(block_bsphere, block_aabb):
+                source_bounds = (block_bsphere[:3], block_aabb, block_bsphere[3])
+        if source_common_mpu is None:
+            value = struct.unpack_from("<f", model_built, MODEL_BUILT_COMMON_MPU_OFFSET)[0]
+            if math.isfinite(value) and value > 0.0:
+                source_common_mpu = float(value)
+        if source_vertex_mpu is None:
+            value = struct.unpack_from("<f", model_built, MODEL_BUILT_VERTEX_MPU_OFFSET)[0]
+            if math.isfinite(value) and value > 0.0:
+                source_vertex_mpu = float(value)
+    except Exception:
+        pass
+
+    return source_bounds, source_common_mpu, source_vertex_mpu
+
+
+def _higher_power_of_two(value):
+    value = max(1, int(value))
+    return 1 << (value - 1).bit_length()
+
+
+def _model_mpu_from_bounds(center, extents):
+    mins = [float(center[axis]) - float(extents[axis]) for axis in range(3)]
+    maxs = [float(center[axis]) + float(extents[axis]) for axis in range(3)]
+    min_component = min(mins)
+    max_component = max(maxs)
+
+    unbounded_int_min = int(math.ceil(abs(min_component) * float(1 << 15)))
+    unbounded_int_max = int(math.ceil(abs(max_component) * float(1 << 15)))
+    unbounded_int_range = max(unbounded_int_min, unbounded_int_max + 1)
+    max_component_aligned = float(_higher_power_of_two(unbounded_int_range) >> 15)
+
+    vertex_range = max(max_component_aligned, 8.0)
+    return vertex_range / float(1 << 15)
+
+
+def _combine_model_bounds(source_bounds, subset_stats):
+    bounds = []
+    radius_sources = []
+    if source_bounds:
+        source_center, source_extents, source_radius = source_bounds
+        source_center = tuple(float(v) for v in source_center)
+        source_extents = tuple(float(v) for v in source_extents)
+        source_radius = float(source_radius)
+        source_mins = tuple(source_center[axis] - source_extents[axis] for axis in range(3))
+        source_maxs = tuple(source_center[axis] + source_extents[axis] for axis in range(3))
+        if subset_stats:
+            all_inside_source = True
+            for stat in subset_stats:
+                center = tuple(float(stat["center"][axis]) for axis in range(3))
+                extents = tuple(float(stat["extents"][axis]) for axis in range(3))
+                radius = float(stat.get("radius", 0.0))
+                if any(center[axis] - extents[axis] < source_mins[axis] for axis in range(3)):
+                    all_inside_source = False
+                    break
+                if any(center[axis] + extents[axis] > source_maxs[axis] for axis in range(3)):
+                    all_inside_source = False
+                    break
+                if _vec_len(_vec_sub(center, source_center)) + radius > source_radius:
+                    all_inside_source = False
+                    break
+            if all_inside_source:
+                return source_center, source_extents, source_radius
+        bounds.append((
+            source_mins,
+            source_maxs,
+        ))
+        radius_sources.append((source_center, source_radius))
+    for stat in subset_stats:
+        center = tuple(float(stat["center"][axis]) for axis in range(3))
+        extents = tuple(float(stat["extents"][axis]) for axis in range(3))
+        radius = float(stat.get("radius", 0.0))
+        bounds.append((
+            tuple(center[axis] - extents[axis] for axis in range(3)),
+            tuple(center[axis] + extents[axis] for axis in range(3)),
+        ))
+        radius_sources.append((center, radius))
+
+    if not bounds:
+        return (0.0, 0.0, 0.0), (0.0, 0.0, 0.0), 0.0
+
+    mins = [min(item[0][axis] for item in bounds) for axis in range(3)]
+    maxs = [max(item[1][axis] for item in bounds) for axis in range(3)]
+    center = tuple((mins[axis] + maxs[axis]) * 0.5 for axis in range(3))
+    extents = tuple((maxs[axis] - mins[axis]) * 0.5 for axis in range(3))
+    radius_padding = max(MODEL_GLOBAL_BOUNDS_PADDING, max((radius for _center, radius in radius_sources), default=0.0) * 0.01)
+    radius = max((_vec_len(_vec_sub(item_center, center)) + item_radius for item_center, item_radius in radius_sources), default=0.0)
+    return center, tuple(value + radius_padding for value in extents), radius + radius_padding
+
+
+def _build_model_built_block(template, subset_stats, arm=None):
+    block_hash = BLOCK_HASHES["ModelBuilt"]
+    original = bytearray(template.payload(block_hash) if block_hash in template.blocks else b"\x00" * MODEL_BUILT_SIZE)
+    if len(original) < MODEL_BUILT_SIZE:
+        original += b"\x00" * (MODEL_BUILT_SIZE - len(original))
+    model_built = original[:MODEL_BUILT_SIZE]
+
+    flags = struct.unpack_from("<Q", model_built, MODEL_BUILT_FLAGS_OFFSET)[0]
+    flags &= ~(MODEL_FLAG_ANIM_VERT | MODEL_FLAG_ANIM_DYNAMICS | MODEL_FLAG_USES_AUTO_LODS)
+    if not any(stat.get("skinned") for stat in subset_stats):
+        flags &= ~(MODEL_FLAG_HAS_SKINNING | MODEL_FLAG_HAS_GPU_SKINNING)
+    struct.pack_into("<Q", model_built, MODEL_BUILT_FLAGS_OFFSET, flags)
+
+    source_bounds, source_common_mpu, source_vertex_mpu = _source_model_built_state(model_built, arm=arm)
+
+    center, extents, radius = _combine_model_bounds(source_bounds, subset_stats)
+
+    common_mpu = source_common_mpu
+    bounds_mpu = _model_mpu_from_bounds(center, extents) if radius > 0.0 else MODEL_DEFAULT_MPU
+    if common_mpu is None:
+        common_mpu = bounds_mpu
+    else:
+        common_mpu = max(common_mpu, bounds_mpu)
+    if not (math.isfinite(common_mpu) and common_mpu > 0.0):
+        common_mpu = MODEL_DEFAULT_MPU
+
+    subset_vertex_mpus = []
+    for stat in subset_stats:
+        try:
+            stat_mpu = float(stat.get("mpu", 0.0) or 0.0)
+        except Exception:
+            continue
+        if math.isfinite(stat_mpu) and stat_mpu > 0.0:
+            subset_vertex_mpus.append(stat_mpu)
+    subset_vertex_mpu = max(subset_vertex_mpus) if subset_vertex_mpus else None
+    vertex_mpu = subset_vertex_mpu if subset_vertex_mpu is not None else source_vertex_mpu
+    if vertex_mpu is None:
+        vertex_mpu = common_mpu
+    if not (math.isfinite(vertex_mpu) and vertex_mpu > 0.0):
+        vertex_mpu = common_mpu
+
+    struct.pack_into("<H", model_built, MODEL_BUILT_FADE_OUT_DIST_OFFSET, 0)
+    struct.pack_into("<4f", model_built, MODEL_BUILT_BSPHERE_OFFSET, center[0], center[1], center[2], radius)
+    struct.pack_into("<3f", model_built, MODEL_BUILT_AABB_EXTENTS_OFFSET, extents[0], extents[1], extents[2])
+    struct.pack_into("<f", model_built, MODEL_BUILT_COMMON_MPU_OFFSET, common_mpu)
+    struct.pack_into("<f", model_built, MODEL_BUILT_VERTEX_MPU_OFFSET, vertex_mpu)
+    struct.pack_into("<I", model_built, MODEL_BUILT_CUSTOM_STREAM_COUNT_OFFSET, sum(stat["custom_stream_count"] for stat in subset_stats))
+    struct.pack_into("<H", model_built, MODEL_BUILT_SUBSET_LOD_MASK_COUNT_OFFSET, len(subset_stats))
+    struct.pack_into("<b", model_built, MODEL_BUILT_STRAND_SUBSET_COUNT_OFFSET, 0)
+    return bytes(model_built)
+
+
+def _build_inert_look_bvh_blocks(template):
+    replacements = {}
+    bvh_hash = BLOCK_HASHES.get("ModelLookBVHInfo")
+    if bvh_hash in template.blocks:
+        replacements[bvh_hash] = struct.pack("<4I", 0, 0, 0, 0)
+    bvh_lod_hash = BLOCK_HASHES.get("ModelLookBVHLoDInfo")
+    if bvh_lod_hash in template.blocks:
+        replacements[bvh_lod_hash] = b"\x00" * 64
+    return replacements
+
+
+def _block_alignment(block_hash):
+    cacheline_blocks = {
+        BLOCK_HASHES.get("ModelSubset"),
+        BLOCK_HASHES.get("ModelLook"),
+        BLOCK_HASHES.get("ModelLookBuilt"),
+        BLOCK_HASHES.get("ModelLookBVHInfo"),
+    }
+    return DAT1_CACHELINE_ALIGN if block_hash in cacheline_blocks else DAT1_BLOCK_ALIGN
+
+
+def _rebuild_dat1(template, replacements, string_pool):
+    if template.fixup_count != 0:
+        raise ValueError("model export currently supports DAT1 files with zero fixups only")
+
+    physical_hashes = [
+        entry[0]
+        for entry in sorted(template.entries, key=lambda item: item[1])
+    ]
+    geom_hash = BLOCK_HASHES["ModelSubsetGeomData"]
+    if geom_hash in physical_hashes:
+        physical_hashes = [h for h in physical_hashes if h != geom_hash] + [geom_hash]
+
+    strings = string_pool.bytes()
+    cursor = template.sb_offset + len(strings)
+    payload_by_hash = {}
+    offset_by_hash = {}
+    body = bytearray()
+
+    for block_hash in physical_hashes:
+        payload = replacements.get(block_hash)
+        if payload is None:
+            payload = template.payload(block_hash)
+        if block_hash == geom_hash:
+            original_geom_offset, original_geom_size = template.blocks[geom_hash]
+            if len(payload) < original_geom_size:
+                payload += b"\x00" * (original_geom_size - len(payload))
+        alignment = _block_alignment(block_hash)
+        aligned = _align(cursor, alignment)
+        if block_hash == geom_hash and aligned <= original_geom_offset:
+            aligned = original_geom_offset
+        pad = aligned - cursor
+        if pad:
+            body += b"\x00" * pad
+            cursor = aligned
+        offset_by_hash[block_hash] = cursor
+        payload_by_hash[block_hash] = payload
+        body += payload
+        cursor += len(payload)
+
+    block_table_entries = []
+    for block_hash in sorted(payload_by_hash):
+        payload = payload_by_hash[block_hash]
+        block_table_entries.append(struct.pack("<III", block_hash, offset_by_hash[block_hash], len(payload)))
+    block_table = b"".join(block_table_entries)
+    declared_size = DAT1_HEADER_SIZE + len(block_table) + len(template.fixup_table) + len(strings) + len(body)
+    header = struct.pack("<IIIHH", DAT1_FILE_ID, template.version, declared_size, len(payload_by_hash), template.fixup_count)
+    out = header + block_table + template.fixup_table + strings + bytes(body)
+    return out, offset_by_hash.get(geom_hash, 0), len(payload_by_hash.get(geom_hash, b""))
+
+
+def _asset_chunk_info(size):
+    size = int(size)
+    if size < 0 or size > ASSET_CHUNK_UNCOMPRESSED_MASK:
+        raise ValueError("STG chunk size exceeds the serialized asset header limit")
+    return (
+        size
+        | (size << ASSET_CHUNK_COMPRESSED_SHIFT)
+        | (ASSET_COMPRESSION_NONE << ASSET_CHUNK_COMPRESSION_SHIFT)
+    )
+
+
+def _build_stg_header(version, topology_size, bulk_size):
+    chunks = [_asset_chunk_info(topology_size)]
+    if bulk_size > 0:
+        chunks.append(_asset_chunk_info(bulk_size))
+    serialized_header = struct.pack("<IBBH", version, 0, len(chunks), 0)
+    serialized_header += b"".join(struct.pack("<Q", chunk) for chunk in chunks)
+    stg = bytearray()
+    stg += struct.pack("<IIII", STG_MAGIC, STG_VERSION, len(serialized_header), 0)
+    stg += serialized_header
+    _align_buffer(stg, STG_HEADER_ALIGN)
+    return bytes(stg)
+
+
+class ExportEngineModel(Operator, ExportHelper):
+    bl_idname = "export_scene.engine_model"
+    bl_label = "Export Luna Engine Model"
+    bl_description = "Export selected/imported Luna Engine Model geometry using the original .model as a template"
+    bl_options = {'REGISTER', 'UNDO', 'PRESET'}
+    filename_ext = ".model"
+    filter_glob: StringProperty(default="*.model;*.dat1", options={'HIDDEN'})
+    stg_mode: EnumProperty(
+        name="Output Format",
+        items=[
+            ("SCENE", "Scene Setting", "Use the Luna Engine panel STG checkbox"),
+            ("AUTO", "Auto", "Match the imported source file wrapper"),
+            ("STG", "STG+DAT1", "Write a model-style STG header before DAT1"),
+            ("RAW", "Raw DAT1", "Write DAT1 without an STG header"),
+        ],
+        default="SCENE",
+        options={'HIDDEN', 'SKIP_SAVE'},
+    )
+
+    def draw(self, context):
+        return
+
+    def execute(self, context):
+        arm = _resolve_model_armature(context)
+        if not arm:
+            self.report({'ERROR'}, "Select an imported model armature or one of its mesh children before exporting.")
+            return {'CANCELLED'}
+
+        source_path = _source_path_from_armature(arm)
+        if not source_path or not os.path.isfile(source_path):
+            self.report({'ERROR'}, "Imported source .model path is missing. Re-import the model, then export.")
+            return {'CANCELLED'}
+
+        try:
+            template = _Dat1Template(source_path)
+        except Exception as exc:
+            self.report({'ERROR'}, f"Could not read source model template: {exc}")
+            return {'CANCELLED'}
+
+        required = ("ModelBuilt", "ModelMaterial", "ModelLook", "ModelLookGroup", "ModelLookBuilt", "ModelSubset", "ModelSubsetGeomData")
+        missing = [name for name in required if BLOCK_HASHES[name] not in template.blocks]
+        if missing:
+            self.report({'ERROR'}, f"Source model is missing required block(s): {', '.join(missing)}")
+            return {'CANCELLED'}
+
+        mesh_objects = [
+            obj for obj in bpy.data.objects
+            if getattr(obj, "type", None) == "MESH" and getattr(obj, "parent", None) == arm
+            and obj.get("engine_bounds_type", "") != "subset_aabb"
+        ]
+        resolve_subset_index_collisions(arm)
+        sanitize_model_look_metadata(arm, mark_modified=True)
+
+        def subset_sort_key(obj):
+            value = obj.get("engine_subset_index", None)
+            return (999999 if value is None else int(value), obj.name)
+
+        mesh_objects.sort(key=subset_sort_key)
+        if not mesh_objects:
+            self.report({'ERROR'}, "No mesh children found under the selected model armature.")
+            return {'CANCELLED'}
+
+        wm = context.window_manager
+        wm.progress_begin(0, 100)
+        export_warnings = []
+        try:
+            wm.progress_update(10)
+            original_materials = _parse_model_materials(template.data, template.blocks)
+            material_entries, material_indices = _build_material_entries(mesh_objects, original_materials, export_warnings)
+            string_pool = _StringPool(template.sb_offset, template.string_buffer)
+
+            wm.progress_update(30)
+            hierarchy_hash = BLOCK_HASHES["ModelJointHierarchy"]
+            if hierarchy_hash in template.blocks:
+                hierarchy = template.payload(hierarchy_hash)
+                source_joint_count = struct.unpack_from("<H", hierarchy, 2)[0] if len(hierarchy) >= 4 else None
+            else:
+                source_joint_count = 0
+            subset_block, geom_block, subset_stats, subset_index_map = _build_geometry_and_subset_blocks(
+                mesh_objects,
+                arm,
+                material_indices,
+                template,
+                source_joint_count,
+                export_warnings=export_warnings,
+            )
+            material_block = _build_material_block(material_entries, string_pool)
+            generated_subset_count = len(subset_stats)
+            look_block, look_built_block, look_group_block = _build_look_blocks(
+                generated_subset_count,
+                string_pool,
+                template,
+                arm=arm,
+                subset_index_map=subset_index_map,
+            )
+            model_built_block = _build_model_built_block(template, subset_stats, arm=arm)
+
+            replacements = {
+                BLOCK_HASHES["ModelBuilt"]: model_built_block,
+                BLOCK_HASHES["ModelMaterial"]: material_block,
+                BLOCK_HASHES["ModelLook"]: look_block,
+                BLOCK_HASHES["ModelLookBuilt"]: look_built_block,
+                BLOCK_HASHES["ModelLookGroup"]: look_group_block,
+                BLOCK_HASHES["ModelSubset"]: subset_block,
+                BLOCK_HASHES["ModelSubsetGeomData"]: geom_block,
+            }
+            replacements.update(_build_inert_look_bvh_blocks(template))
+
+            wm.progress_update(75)
+            dat1, geom_offset, geom_size = _rebuild_dat1(template, replacements, string_pool)
+            source_had_stg = bool(template.had_stg or arm.get("engine_model_source_had_stg", False))
+            stg_mode = str(getattr(self, "stg_mode", "SCENE") or "SCENE")
+            if stg_mode == "STG":
+                add_stg = True
+            elif stg_mode == "RAW":
+                add_stg = False
+            elif stg_mode == "AUTO":
+                add_stg = source_had_stg
+            else:
+                add_stg = bool(getattr(context.scene, "engine_export_add_stg_header", False))
+            if add_stg:
+                stg_header = _build_stg_header(template.version, geom_offset, geom_size)
+                out = stg_header + dat1
+                format_name = "STG+DAT1"
+            else:
+                out = dat1
+                format_name = "raw DAT1"
+
+            with open(self.filepath, "wb") as f:
+                f.write(out)
+        except Exception as exc:
+            log_exception("Model export failed")
+            wm.progress_end()
+            self.report({'ERROR'}, f"Model export failed: {exc}")
+            return {'CANCELLED'}
+
+        wm.progress_update(100)
+        wm.progress_end()
+        if export_warnings:
+            self.report({'WARNING'}, _format_export_warnings(export_warnings))
+        self.report(
+            {'INFO'},
+            f"Wrote {format_name}: {len(mesh_objects)} LOD0 mesh(es), {sum(s['vertex_count'] for s in subset_stats)} vertices, {sum(s['index_count'] // 3 for s in subset_stats)} triangles."
+        )
+        return {'FINISHED'}
