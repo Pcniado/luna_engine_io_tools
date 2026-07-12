@@ -63,6 +63,26 @@ def _engine_uv_to_blender(uv):
     return (float(uv[0]), 1.0 - float(uv[1]))
 
 
+def _decode_azimuthal(x, y, z_sign):
+    enc_x = float(x) * (4.0 / 1.41421356) - (2.0 / 1.41421356)
+    enc_y = float(y) * (4.0 / 1.41421356) - (2.0 / 1.41421356)
+    f = enc_x * enc_x + enc_y * enc_y
+    xy_scale = math.sqrt(max(0.0, 1.0 - f * 0.25))
+    z = abs(1.0 - f * 0.5)
+    if float(z_sign) < 0.5:
+        z = -z
+    return (enc_x * xy_scale, enc_y * xy_scale, z)
+
+
+def _decode_packed_normal(word):
+    word = int(word) & U32_MASK
+    x = float(word & 0x3FF) / 1023.0
+    y = float((word >> 10) & 0x3FF) / 1023.0
+    alpha = float((word >> 30) & 0x3) / 3.0
+    normal_z = max(0.0, min(1.0, alpha * 3.0 - 1.0))
+    return _decode_azimuthal(x, y, normal_z)
+
+
 def _parse_model_materials(data, blocks):
     material_block = blocks.get(BLOCK_HASHES.get("ModelMaterial"))
     if not material_block:
@@ -598,6 +618,17 @@ class ImportEngineModel(Operator, ImportHelper):
                 _set_mesh_uv_layer(me, "UV2", loop_vertex_indices, uv2)
                 me.update(calc_edges=True)
                 me.validate(verbose=False)
+
+                vertex_normals = []
+                position_ws = []
+                for vertex_index in range(vtx_count):
+                    raw_vertex = struct.unpack_from("<hhhhIhh", data, v_base + vertex_index * 16)
+                    engine_normal = _decode_packed_normal(raw_vertex[4])
+                    vertex_normals.append((engine_normal[0], -engine_normal[2], engine_normal[1]))
+                    position_ws.append(int(raw_vertex[3]))
+                me.normals_split_custom_set([vertex_normals[int(index)] for index in loop_vertex_indices])
+                position_w_attr = me.attributes.new(name="engine_position_w", type='INT', domain='POINT')
+                position_w_attr.data.foreach_set("value", position_ws)
 
                 obj = bpy.data.objects.new(f"Subset_{s}", me)
                 context.collection.objects.link(obj)

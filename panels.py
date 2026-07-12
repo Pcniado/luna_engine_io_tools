@@ -423,7 +423,8 @@ def _draw_model_selection_panel(layout, context, arm):
     col = box.column(align=True)
     subset_index = int(obj.get("engine_subset_index", -1))
     col.label(text=f"Index: {subset_index}")
-    col.label(text=f"Vertices: {len(getattr(obj.data, 'vertices', []))}")
+    col.label(text=f"Blender vertices: {len(getattr(obj.data, 'vertices', []))}")
+    col.label(text=f"Triangle corners: {sum(len(poly.vertices) for poly in getattr(obj.data, 'polygons', []))}")
     col.label(text=f"Triangles: {len(getattr(obj.data, 'polygons', []))}")
     col.label(text=f"LOD Mask: 0x{int(obj.get('engine_lod_mask', 0)) & 0xFFFF:04X}")
     mat = obj.active_material

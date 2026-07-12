@@ -120,6 +120,11 @@ def _clamp_u8(value):
     return int(_clamp(int(round(value)), 0, 255))
 
 
+def _round_engine(value):
+    value = float(value)
+    return int(math.floor(value + 0.5)) if value >= 0.0 else int(math.ceil(value - 0.5))
+
+
 def _vec_add(a, b):
     return (a[0] + b[0], a[1] + b[1], a[2] + b[2])
 
@@ -634,6 +639,30 @@ def _loop_uv(layer, loop_index):
     return (float(uv.x), 1.0 - float(uv.y))
 
 
+def _uv_nearly_equal(left, right, threshold=0.0001):
+    if left is None or right is None:
+        return left is None and right is None
+    return (
+        abs(float(left[0]) - float(right[0])) <= threshold
+        and abs(float(left[1]) - float(right[1])) <= threshold
+    )
+
+
+def _luna_export_vertex_matches(candidate, normal, tangent, tangent_flip, uv0, uv1, uv2):
+    # ContentTriPool::VertexComparisonParams defaults from the engine builder.
+    if _vec_dot(candidate["normal"], normal) < (1.0 - 0.002):
+        return False
+    if _vec_dot(candidate["tangent"], tangent) < (1.0 - 1.6):
+        return False
+    if (candidate["tangent_flip"] >= 0.0) != (float(tangent_flip) >= 0.0):
+        return False
+    return (
+        _uv_nearly_equal(candidate.get("uv0"), uv0)
+        and _uv_nearly_equal(candidate.get("uv1"), uv1)
+        and _uv_nearly_equal(candidate.get("uv2"), uv2)
+    )
+
+
 def _vertex_group_joint_map(obj, arm):
     if not arm:
         return {}
@@ -681,11 +710,57 @@ def _export_mesh_vertices(obj, arm, source_joint_count, original_flags=0, export
     has_uv1 = _should_export_uv_channel(obj, uv_info, 1, original_flags)
     has_uv2 = _should_export_uv_channel(obj, uv_info, 2, original_flags)
     matrix = _safe_matrix_relative_to_armature(arm, obj)
-    normal_matrix = matrix.to_3x3()
+    linear_matrix = matrix.to_3x3()
+    try:
+        normal_matrix = linear_matrix.inverted().transposed()
+    except Exception:
+        normal_matrix = linear_matrix
+    transform_handedness = -1.0 if linear_matrix.determinant() < 0.0 else 1.0
     group_to_joint = _vertex_group_joint_map(obj, arm)
 
+    if not uv0_layer:
+        raise ValueError(f"{obj.name}: UV0 is required to calculate Luna tangent space")
+    uv0_name = str(uv0_layer.name)
+    try:
+        mesh.calc_tangents(uvmap=uv0_name)
+    except Exception as exc:
+        raise ValueError(f"{obj.name}: Blender could not calculate UV0 tangents: {exc}") from exc
+
+
+    uv0_layer = _uv_layer_by_name_or_index(mesh, "UV0", 0)
+    uv1_layer = _uv_layer_by_name_or_index(mesh, "UV1", 1)
+    uv2_layer = _uv_layer_by_name_or_index(mesh, "UV2", 2)
+
+    source_position_w = None
+    try:
+        attr = mesh.attributes.get("engine_position_w")
+        if attr and attr.domain == 'POINT' and len(attr.data) == len(mesh.vertices):
+            source_position_w = attr.data
+    except Exception:
+        source_position_w = None
+
+
+    luna_subset_normals = bool(arm and _source_path_from_armature(arm))
+    luna_vertex_normals = None
+    if luna_subset_normals:
+        normal_sums = [(0.0, 0.0, 0.0) for _ in mesh.vertices]
+        normal_counts = [0 for _ in mesh.vertices]
+        for corner_index, mesh_loop in enumerate(mesh.loops):
+            corner = mesh.corner_normals[corner_index].vector
+            vertex_index = int(mesh_loop.vertex_index)
+            normal_sums[vertex_index] = _vec_add(
+                normal_sums[vertex_index],
+                (float(corner.x), float(corner.y), float(corner.z)),
+            )
+            normal_counts[vertex_index] += 1
+        luna_vertex_normals = [
+            mathutils.Vector(_vec_normalize(normal_sums[index]))
+            if normal_counts[index] else mesh.vertices[index].normal.copy()
+            for index in range(len(mesh.vertices))
+        ]
+
     export_vertices = []
-    vertex_map = {}
+    vertex_buckets = {}
     indices = []
 
     for triangle in mesh.loop_triangles:
@@ -696,27 +771,43 @@ def _export_mesh_vertices(obj, arm, source_joint_count, original_flags=0, export
             uv0 = _loop_uv(uv0_layer, loop_index)
             uv1 = _loop_uv(uv1_layer, loop_index) if has_uv1 and uv1_layer else None
             uv2 = _loop_uv(uv2_layer, loop_index) if has_uv2 and uv2_layer else None
-            key = (
-                source_vertex_index,
-                round(uv0[0], 7), round(uv0[1], 7),
-                round((uv1 or (0.0, 0.0))[0], 7), round((uv1 or (0.0, 0.0))[1], 7),
-                round((uv2 or (0.0, 0.0))[0], 7), round((uv2 or (0.0, 0.0))[1], 7),
-                bool(uv1), bool(uv2),
+            corner_normal = (
+                luna_vertex_normals[source_vertex_index]
+                if luna_subset_normals
+                else mesh.corner_normals[loop_index].vector
             )
-            export_index = vertex_map.get(key)
+            loop_tangent = loop.tangent
+            normal = _vec_normalize(_blender_to_engine_vec(normal_matrix @ corner_normal))
+            tangent = _vec_normalize(_blender_to_engine_vec(linear_matrix @ loop_tangent), fallback=(1.0, 0.0, 0.0))
+            tangent = _vec_normalize(_vec_sub(tangent, _vec_mul(normal, _vec_dot(normal, tangent))), fallback=(1.0, 0.0, 0.0))
+            tangent_flip = float(loop.bitangent_sign) * transform_handedness
+            extrusion_encoded = 16
+            if source_position_w is not None:
+                extrusion_encoded = (abs(int(source_position_w[source_vertex_index].value)) >> 10) & 0x1F
+            export_index = None
+            for candidate_index in vertex_buckets.get(source_vertex_index, ()):
+                candidate = export_vertices[candidate_index]
+                if _luna_export_vertex_matches(candidate, normal, tangent, tangent_flip, uv0, uv1, uv2):
+                    export_index = candidate_index
+                    candidate["_normal_sum"] = _vec_add(candidate["_normal_sum"], normal)
+                    candidate["_tangent_sum"] = _vec_add(candidate["_tangent_sum"], tangent)
+                    candidate["_basis_count"] += 1
+                    break
             if export_index is None:
                 vertex = mesh.vertices[source_vertex_index]
                 co = matrix @ vertex.co
-                try:
-                    normal = normal_matrix @ vertex.normal
-                except Exception:
-                    normal = vertex.normal
                 export_index = len(export_vertices)
-                vertex_map[key] = export_index
+                vertex_buckets.setdefault(source_vertex_index, []).append(export_index)
                 export_vertices.append({
                     "source_index": source_vertex_index,
                     "co": _blender_to_engine_vec(co),
-                    "normal": _blender_to_engine_vec(normal),
+                    "normal": normal,
+                    "tangent": tangent,
+                    "tangent_flip": tangent_flip,
+                    "extrusion_encoded": extrusion_encoded,
+                    "_normal_sum": normal,
+                    "_tangent_sum": tangent,
+                    "_basis_count": 1,
                     "uv0": uv0,
                     "uv1": uv1,
                     "uv2": uv2,
@@ -724,6 +815,25 @@ def _export_mesh_vertices(obj, arm, source_joint_count, original_flags=0, export
                 })
             tri_indices.append(export_index)
         indices.extend(tri_indices)
+
+
+    for vertex in export_vertices:
+        normal = _vec_normalize(vertex.pop("_normal_sum"))
+        tangent = _vec_normalize(vertex.pop("_tangent_sum"), fallback=(1.0, 0.0, 0.0))
+        tangent = _vec_normalize(
+            _vec_sub(tangent, _vec_mul(normal, _vec_dot(normal, tangent))),
+            fallback=(1.0, 0.0, 0.0),
+        )
+        vertex.pop("_basis_count", None)
+        normal_tangent, tangent_y = _pack_normal_tangent(normal, tangent)
+        vertex["normal"] = normal
+        vertex["tangent"] = tangent
+        vertex["normal_tangent"] = normal_tangent
+        vertex["position_w"] = _pack_position_w(
+            tangent_y,
+            vertex.pop("tangent_flip"),
+            vertex.pop("extrusion_encoded"),
+        )
 
     return export_vertices, indices, bool(has_uv1), bool(has_uv2)
 
@@ -803,14 +913,43 @@ def _pack_uv(uv, log_value):
     )
 
 
-def _pack_normal_tangent(normal):
-    n = _vec_normalize(normal)
-    inv = 1.0 / math.sqrt(max(1e-6, abs(n[2]) * 4.0 + 4.0))
-    nx = _clamp(round((n[0] * inv + 0.5) * 1023.0), 0, 1023)
-    ny = _clamp(round((n[1] * inv + 0.5) * 1023.0), 0, 1023)
-    tx = 1023
-    alpha = 2 if n[2] >= 0.0 else 0
-    return int(nx) | (int(ny) << 10) | (int(tx) << 20) | (int(alpha) << 30)
+def _encode_azimuthal(vector):
+    vector = _vec_normalize(vector)
+    inv_f = 1.0 / math.sqrt(abs(vector[2]) * 4.0 + 4.0)
+    return (
+        vector[0] * inv_f + 0.5,
+        vector[1] * inv_f + 0.5,
+        0.0 if vector[2] < 0.0 else 1.0,
+    )
+
+
+def _pack_normal_tangent(normal, tangent):
+    normal_azim = _encode_azimuthal(normal)
+    tangent_azim = _encode_azimuthal(tangent)
+    norm_tan_z = normal_azim[2] * (2.0 / 3.0) + tangent_azim[2] * (1.0 / 3.0)
+    nx = _clamp(_round_engine(normal_azim[0] * 1023.0), 0, 1023)
+    ny = _clamp(_round_engine(normal_azim[1] * 1023.0), 0, 1023)
+    tx = _clamp(_round_engine(tangent_azim[0] * 1023.0), 0, 1023)
+    ty = _clamp(_round_engine(tangent_azim[1] * 1023.0), 0, 1023)
+    nz_tz = _clamp(_round_engine(norm_tan_z * 3.0), 0, 3)
+    packed = int(nx) | (int(ny) << 10) | (int(tx) << 20) | (int(nz_tz) << 30)
+    return packed, int(ty)
+
+
+def _packed_normal_key(normal):
+    normal_azim = _encode_azimuthal(normal)
+    return (
+        _clamp(_round_engine(normal_azim[0] * 1023.0), 0, 1023),
+        _clamp(_round_engine(normal_azim[1] * 1023.0), 0, 1023),
+        normal_azim[2] >= 0.5,
+    )
+
+
+def _pack_position_w(tangent_y, tangent_flip, extrusion_encoded=16):
+    magnitude = (int(tangent_y) & 0x3FF) | ((int(extrusion_encoded) & 0x1F) << 10)
+    if float(tangent_flip) >= 0.0:
+        return magnitude
+    return -1 if magnitude == 0 else -magnitude
 
 
 def _normalize_skin_weights(weights):
@@ -1077,14 +1216,14 @@ def _build_subset_geometry_from_data(obj, arm, material_index, original_record, 
             int(_clamp(int(round(co[1] / mpu)) - origin_units[1], -32768, 32767)),
             int(_clamp(int(round(co[2] / mpu)) - origin_units[2], -32768, 32767)),
         )
-        normal_tangent = _pack_normal_tangent(vertex.get("normal", (0.0, 0.0, 1.0)))
+        normal_tangent = int(vertex["normal_tangent"])
         uv0 = _pack_uv(vertex.get("uv0", (0.0, 0.0)), uv0_log)
         std_vertices += struct.pack(
             "<hhhhIhh",
             packed_pos[0],
             packed_pos[1],
             packed_pos[2],
-            (16 << 10) | 512,
+            int(vertex["position_w"]),
             normal_tangent,
             uv0[0],
             uv0[1],
@@ -1110,9 +1249,15 @@ def _build_subset_geometry_from_data(obj, arm, material_index, original_record, 
 
     force_skin = bool(original_flags & SUBSET_FLAG_SKINNED) or any(vertex.get("weights") for vertex in vertices)
     if force_skin:
-        for vertex in vertices:
-            if not vertex.get("weights"):
-                vertex["weights"] = [(0, 1.0)]
+        missing_weights = [vertex["source_index"] for vertex in vertices if not vertex.get("weights")]
+        if missing_weights:
+            sample = ", ".join(str(index) for index in missing_weights[:8])
+            suffix = "..." if len(missing_weights) > 8 else ""
+            raise ValueError(
+                f"{obj.name}: {len(missing_weights)} skinned export vertices have no valid bone weights "
+                f"(source vertex indices: {sample}{suffix}). Assign weights before export; Luna cannot "
+                "safely bind missing weights to joint 0."
+            )
     skin_data, cluster_headers = _build_skin_sections(vertices, force_skin)
     vertex_skin_offset = 0
     skin_cluster_offset = 0
