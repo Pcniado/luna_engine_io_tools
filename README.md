@@ -35,8 +35,6 @@ You can also copy the `luna_engine_io_tools` folder into Blender's add-ons direc
 4. Keep **Import Shape Keys** enabled when you want to preserve or edit model deformations.
 5. Click **Import**.
 
-For custom meshes replacing a fixed-topology Ziva model, see [ZIVA_WORKFLOW.md](ZIVA_WORKFLOW.md).
-
 ### Exporting models
 
 1. Select the model/armature hierarchy you want to export.
