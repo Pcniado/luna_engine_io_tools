@@ -89,6 +89,370 @@ class MODEL_OT_export_with_model_settings(Operator):
         return bpy.ops.export_scene.engine_model('INVOKE_DEFAULT', stg_mode=mode)
 
 
+class MODEL_OT_sync_morph_controls(Operator):
+    bl_idname = "model.sync_morph_controls"
+    bl_label = "Refresh Deformation Controls"
+    bl_description = "Connect same-named registered shape keys on every model subset to shared root-armature sliders"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        arm = _model_armature_from_context(context)
+        if not arm:
+            self.report({'ERROR'}, "Select the model armature or one of its mesh children.")
+            return {'CANCELLED'}
+        try:
+            controls = sync_armature_morph_controls(arm)
+        except Exception as exc:
+            self.report({'ERROR'}, f"Could not refresh deformation controls: {exc}")
+            return {'CANCELLED'}
+        self.report({'INFO'}, f"Connected {len(controls)} model-level deformation control(s).")
+        return {'FINISHED'}
+
+
+def _original_model_blendshape_channels(arm):
+    source_path = str(arm.get("engine_model_source_path", "") or "")
+    if not source_path or not os.path.isfile(source_path):
+        raise ValueError("the original imported .model file is unavailable")
+
+    channels = []
+    data, blocks, _string_base = get_dat1_data(source_path)
+    if not data:
+        raise ValueError("the original .model does not contain a valid DAT1")
+    morph = decode_model_morph2(data, blocks)
+    if morph is not None:
+        for target in morph.get("targets", []):
+            channels.append({
+                "index": int(target.get("index", -1)),
+                "name": str(target.get("name", "") or ""),
+                "hash": int(target.get("hash", 0)) & U32_MASK,
+                "kind": "MORPH2",
+                "driver_status": "AUTOMATIC_MORPH",
+            })
+
+    ziva_model = load_ziva_model(source_path)
+    if ziva_model is not None:
+        channels.extend(dict(channel) for channel in ziva_model.sliders)
+
+    unique = []
+    names = {}
+    hashes = {}
+    for channel in channels:
+        name = str(channel.get("name", "") or "").strip()
+        name_hash = int(channel.get("hash", 0)) & U32_MASK
+        if not name:
+            continue
+        previous_hash = names.get(name)
+        if previous_hash is not None:
+            if previous_hash != name_hash:
+                raise ValueError(f"blendshape {name!r} has conflicting source hashes")
+            continue
+        previous_name = hashes.get(name_hash)
+        if previous_name is not None and previous_name != name:
+            raise ValueError(f"blendshape hash collision: {previous_name!r} and {name!r}")
+        names[name] = name_hash
+        hashes[name_hash] = name
+        unique.append(channel)
+    if not unique:
+        raise ValueError("the original .model contains no named Morph2 or Ziva blendshapes")
+    return unique
+
+
+class MODEL_OT_create_original_blendshape_names(Operator):
+    bl_idname = "model.create_original_blendshape_names"
+    bl_label = "Create Original Blendshape Names"
+    bl_description = "Read the original .model and create its named blendshapes as ordinary Blender shape keys on every mesh under this armature"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        arm = _model_armature_from_context(context)
+        if not arm:
+            self.report({'ERROR'}, "Select the imported model armature.")
+            return {'CANCELLED'}
+        meshes = [
+            obj for obj in bpy.data.objects
+            if obj.type == 'MESH'
+            and obj.parent == arm
+            and len(obj.data.vertices)
+            and obj.get("engine_bounds_type", "") != "subset_aabb"
+        ]
+        if not meshes:
+            self.report({'ERROR'}, "Parent at least one custom mesh directly to the imported armature first.")
+            return {'CANCELLED'}
+        try:
+            channels = _original_model_blendshape_channels(arm)
+            result = create_empty_ziva_targets(meshes, channels, overwrite=False)
+            arm["engine_ziva_mode"] = "CUSTOM_MORPH2"
+            arm["engine_model_shape_keys_imported"] = True
+            arm["engine_model_morph_target_count"] = len(channels)
+            controls = sync_armature_morph_controls(arm)
+        except Exception as exc:
+            self.report({'ERROR'}, f"Could not create original blendshapes: {exc}")
+            return {'CANCELLED'}
+        self.report(
+            {'INFO'},
+            f"Created {result['created']} ordinary shape key(s) on {len(meshes)} mesh(es); "
+            f"{result['existing']} already existed; {len(controls)} armature preview slider(s).",
+        )
+        return {'FINISHED'}
+
+
+def _ziva_model_for_armature(arm, force=False):
+    source_path = str(arm.get("engine_model_source_path", "") or "")
+    if not source_path or not os.path.isfile(source_path):
+        raise ValueError("the imported source .model file is unavailable")
+    if force:
+        clear_ziva_cache()
+    model = load_ziva_model(source_path, use_cache=not force)
+    if model is None:
+        raise ValueError("the source model does not contain compiled Ziva data")
+    arm["engine_ziva_metadata_json"] = json.dumps(
+        model.metadata(), separators=(",", ":"), sort_keys=True
+    )
+    return model
+
+
+def _ziva_selected_meshes(context, arm):
+    result = []
+    for obj in list(getattr(context, "selected_objects", []) or []):
+        if obj.type == 'MESH' and obj.parent == arm and obj.get("engine_bounds_type", "") != "subset_aabb":
+            result.append(obj)
+    active = getattr(context, "active_object", None)
+    if active and active.type == 'MESH' and active.parent == arm and active not in result:
+        result.append(active)
+    return result
+
+
+def _ziva_active_channel(arm, model):
+    value = str(getattr(arm, "engine_ziva_active_channel", "NONE") or "NONE")
+    try:
+        index = int(value)
+    except Exception:
+        raise ValueError("this source has no named Ziva channels")
+    if not 0 <= index < len(model.sliders):
+        raise ValueError("the selected Ziva channel is no longer valid; reload its metadata")
+    return model.sliders[index]
+
+
+class MODEL_OT_reload_ziva(Operator):
+    bl_idname = "model.reload_ziva"
+    bl_label = "Reload Ziva Source"
+    bl_description = "Re-read and validate the compiled Ziva solver from the imported source model"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        arm = _model_armature_from_context(context)
+        if not arm:
+            self.report({'ERROR'}, "Select the imported model armature or one of its mesh children.")
+            return {'CANCELLED'}
+        try:
+            model = _ziva_model_for_armature(arm, force=True)
+        except Exception as exc:
+            self.report({'ERROR'}, f"Could not load Ziva source: {exc}")
+            return {'CANCELLED'}
+        self.report(
+            {'INFO'},
+            f"Loaded {model.elem_count} element(s), {len(model.sliders)} named channel(s), "
+            f"and {model.joint_lookup_count} joint input(s).",
+        )
+        return {'FINISHED'}
+
+
+class MODEL_OT_prepare_custom_ziva(Operator):
+    bl_idname = "model.prepare_custom_ziva"
+    bl_label = "Prepare Custom Ziva Replacement"
+    bl_description = "Use editable Morph2 targets for custom meshes instead of exporting the source fixed-topology Ziva solver"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        arm = _model_armature_from_context(context)
+        if not arm:
+            self.report({'ERROR'}, "Select the imported model armature or a parented replacement mesh.")
+            return {'CANCELLED'}
+        try:
+            model = _ziva_model_for_armature(arm)
+        except Exception as exc:
+            self.report({'ERROR'}, f"Could not prepare Ziva conversion: {exc}")
+            return {'CANCELLED'}
+        arm["engine_ziva_mode"] = "CUSTOM_MORPH2"
+        selected = _ziva_selected_meshes(context, arm)
+        for obj in selected:
+            element = int(getattr(obj, "engine_ziva_element_index", obj.get("engine_ziva_element_index", 0)))
+            if not 0 <= element < model.elem_count:
+                obj.engine_ziva_element_index = 0
+        self.report(
+            {'INFO'},
+            f"Custom Morph2 conversion enabled. Select parented meshes and transfer {len(model.sliders)} named channel(s).",
+        )
+        return {'FINISHED'}
+
+
+class _MODEL_OT_transfer_ziva_base:
+    transfer_active_only = False
+
+    def execute(self, context):
+        arm = _model_armature_from_context(context)
+        if not arm:
+            self.report({'ERROR'}, "Select the imported armature or a parented replacement mesh.")
+            return {'CANCELLED'}
+        objects = _ziva_selected_meshes(context, arm)
+        if not objects:
+            self.report({'ERROR'}, "Select at least one nonempty mesh parented directly to the model armature.")
+            return {'CANCELLED'}
+        try:
+            model = _ziva_model_for_armature(arm)
+            channels = [_ziva_active_channel(arm, model)] if self.transfer_active_only else list(model.sliders)
+            arm["engine_ziva_mode"] = "CUSTOM_MORPH2"
+            wm = context.window_manager
+            wm.progress_begin(0, max(1, len(channels)))
+            try:
+                result = transfer_ziva_channels_to_objects(
+                    model,
+                    arm,
+                    objects,
+                    channels=channels,
+                    overwrite=bool(getattr(arm, "engine_ziva_overwrite_targets", False)),
+                    max_distance=float(getattr(arm, "engine_ziva_transfer_distance", 0.05)),
+                    progress=lambda current, total, channel: wm.progress_update(current),
+                )
+            finally:
+                wm.progress_end()
+            controls = sync_armature_morph_controls(arm)
+        except Exception as exc:
+            self.report({'ERROR'}, f"Ziva transfer failed: {exc}")
+            return {'CANCELLED'}
+        unmapped = sum(int(item["unmapped"]) for item in result["objects"].values())
+        external = sum(
+            channel.get("driver_status") in {"GAME_BRIDGE_REQUIRED", "EXTERNAL"}
+            for channel in channels
+        )
+        suffix = f"; {external} need a Ziva-track-to-Morph2 game bridge" if external else ""
+        self.report(
+            {'WARNING'} if unmapped else {'INFO'},
+            f"Created {result['created']} target instance(s), {result['empty']} empty, "
+            f"{unmapped} unmapped vertices; {len(controls)} shared control(s){suffix}.",
+        )
+        return {'FINISHED'}
+
+
+class MODEL_OT_transfer_active_ziva(_MODEL_OT_transfer_ziva_base, Operator):
+    bl_idname = "model.transfer_active_ziva"
+    bl_label = "Transfer Selected Channel"
+    bl_description = "Evaluate the selected compiled Ziva channel and transfer its displacement to selected replacement meshes"
+    bl_options = {'REGISTER', 'UNDO'}
+    transfer_active_only = True
+
+
+class MODEL_OT_transfer_all_ziva(_MODEL_OT_transfer_ziva_base, Operator):
+    bl_idname = "model.transfer_all_ziva"
+    bl_label = "Transfer All Named Channels"
+    bl_description = "Evaluate every named compiled Ziva channel and transfer their displacements to selected replacement meshes"
+    bl_options = {'REGISTER', 'UNDO'}
+
+
+class MODEL_OT_create_empty_ziva_targets(Operator):
+    bl_idname = "model.create_empty_ziva_targets"
+    bl_label = "Create Empty Named Targets"
+    bl_description = "Create registered same-named shape keys for manual sculpting while preserving the game's channel hashes"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        arm = _model_armature_from_context(context)
+        if not arm:
+            self.report({'ERROR'}, "Select the imported armature or a parented replacement mesh.")
+            return {'CANCELLED'}
+        objects = _ziva_selected_meshes(context, arm)
+        if not objects:
+            self.report({'ERROR'}, "Select at least one mesh parented directly to the model armature.")
+            return {'CANCELLED'}
+        try:
+            model = _ziva_model_for_armature(arm)
+            if not model.sliders:
+                raise ValueError("this Ziva rig has no named slider channels; use pose capture for joint-only deformation")
+            result = create_empty_ziva_targets(
+                objects,
+                model.sliders,
+                overwrite=bool(getattr(arm, "engine_ziva_overwrite_targets", False)),
+            )
+            arm["engine_ziva_mode"] = "CUSTOM_MORPH2"
+            controls = sync_armature_morph_controls(arm)
+        except Exception as exc:
+            self.report({'ERROR'}, f"Could not create targets: {exc}")
+            return {'CANCELLED'}
+        self.report(
+            {'INFO'},
+            f"Created {result['created']} empty target(s); {result['existing']} already existed; "
+            f"{len(controls)} shared control(s).",
+        )
+        return {'FINISHED'}
+
+
+class MODEL_OT_capture_ziva_pose(Operator):
+    bl_idname = "model.capture_ziva_pose"
+    bl_label = "Capture Current Ziva Pose"
+    bl_description = "Evaluate the compiled joint-driven Ziva solver at the current armature pose and transfer it to a registered Morph2 target"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    target_name: StringProperty(
+        name="Target Name",
+        description="Morph2 target name and game-visible CRC32 identity; a new name requires a matching game-side driver",
+        default="",
+    )
+
+    def invoke(self, context, event):
+        if not self.target_name:
+            self.target_name = f"ziva_pose_{int(context.scene.frame_current)}"
+        return context.window_manager.invoke_props_dialog(self, width=420)
+
+    def draw(self, context):
+        col = self.layout.column(align=True)
+        col.prop(self, "target_name")
+        col.label(text="Captured targets need a matching game-side driver or an existing known hash.", icon='INFO')
+
+    def execute(self, context):
+        arm = _model_armature_from_context(context)
+        if not arm:
+            self.report({'ERROR'}, "Select the imported armature or a parented replacement mesh.")
+            return {'CANCELLED'}
+        objects = _ziva_selected_meshes(context, arm)
+        if not objects:
+            self.report({'ERROR'}, "Select at least one mesh parented directly to the model armature.")
+            return {'CANCELLED'}
+        try:
+            model = _ziva_model_for_armature(arm)
+            names = [""] * model.model_joint_count
+            for bone in arm.data.bones:
+                joint_index = int(bone.get("engine_joint_index", -1))
+                if 0 <= joint_index < len(names):
+                    names[joint_index] = bone.name
+            local_matrices = _compute_frame_engine_locals(
+                arm,
+                names,
+                model.joint_parents,
+                int(context.scene.frame_current),
+            )
+            result = transfer_ziva_pose_to_objects(
+                model,
+                arm,
+                objects,
+                local_matrices,
+                self.target_name,
+                overwrite=bool(getattr(arm, "engine_ziva_overwrite_targets", False)),
+                max_distance=float(getattr(arm, "engine_ziva_transfer_distance", 0.05)),
+            )
+            arm["engine_ziva_mode"] = "CUSTOM_MORPH2"
+            controls = sync_armature_morph_controls(arm)
+        except Exception as exc:
+            self.report({'ERROR'}, f"Could not capture Ziva pose: {exc}")
+            return {'CANCELLED'}
+        unmapped = sum(int(item["unmapped"]) for item in result["objects"].values())
+        self.report(
+            {'WARNING'},
+            f"Captured {result['created']} target instance(s), {result['empty']} empty, "
+            f"{unmapped} unmapped vertices; {len(controls)} shared control(s). A game-side driver is required.",
+        )
+        return {'FINISHED'}
+
+
 def _model_armature_from_context(context):
     return _resolve_anim_armature(context)
 

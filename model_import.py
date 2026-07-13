@@ -2,6 +2,8 @@
 # Behavior-sensitive logic was moved mechanically; avoid algorithm changes here.
 
 from .utils import *
+from .model_morph import decode_model_morph2, sync_armature_morph_controls
+from .model_ziva import ZIVA_INVALID_ELEM, load_ziva_model, transfer_ziva_channels_to_objects
 
 MODEL_BIND_POSE_FLOATS_PER_JOINT = 12
 MODEL_JOINT_RECORD_SIZE = 16
@@ -81,6 +83,57 @@ def _decode_packed_normal(word):
     alpha = float((word >> 30) & 0x3) / 3.0
     normal_z = max(0.0, min(1.0, alpha * 3.0 - 1.0))
     return _decode_azimuthal(x, y, normal_z)
+
+
+def _engine_delta_to_blender(delta):
+    return (float(delta[0]), -float(delta[2]), float(delta[1]))
+
+
+def _import_morph_shape_keys(morph, subset_objects, arm, wm=None):
+    if not morph:
+        return 0
+    metadata_by_object = {}
+    imported_count = 0
+    total_targets = max(1, len(morph.get("targets", [])))
+    for target_index, target in enumerate(morph.get("targets", [])):
+        for subset in target.get("subsets", []):
+            obj = subset_objects.get(int(subset.get("subset_index", -1)))
+            if obj is None:
+                continue
+            mesh = obj.data
+            if mesh.shape_keys is None or not mesh.shape_keys.key_blocks:
+                obj.shape_key_add(name="Basis", from_mix=False)
+            key = obj.shape_key_add(name=str(target.get("name", "Morph")), from_mix=False)
+            coords = np.empty(len(mesh.vertices) * 3, dtype=np.float32)
+            mesh.vertices.foreach_get("co", coords)
+            for vertex_index, engine_delta in subset.get("deltas", {}).items():
+                vertex_index = int(vertex_index)
+                if not 0 <= vertex_index < len(mesh.vertices):
+                    raise ValueError(
+                        f"Morph target {target.get('name', target_index)} references vertex {vertex_index} "
+                        f"outside subset {subset.get('subset_index')}"
+                    )
+                delta = _engine_delta_to_blender(engine_delta)
+                base = vertex_index * 3
+                coords[base] += delta[0]
+                coords[base + 1] += delta[1]
+                coords[base + 2] += delta[2]
+            key.data.foreach_set("co", coords)
+            key.value = 0.0
+            metadata_by_object.setdefault(obj, {})[key.name] = {
+                "name": str(target.get("name", key.name)),
+                "hash": int(target.get("hash", 0)) & U32_MASK,
+                "index": int(target.get("index", target_index)),
+            }
+            imported_count += 1
+        if wm and (target_index & 15) == 0:
+            wm.progress_update(95 + int(4 * (target_index / total_targets)))
+    for obj, metadata in metadata_by_object.items():
+        obj["engine_morph_targets_json"] = json.dumps(metadata, separators=(",", ":"), sort_keys=True)
+        obj["engine_morph_shape_keys_imported"] = True
+    arm["engine_model_shape_keys_imported"] = True
+    arm["engine_model_morph_target_count"] = int(morph.get("target_count", 0))
+    return imported_count
 
 
 def _parse_model_materials(data, blocks):
@@ -342,9 +395,16 @@ class ImportEngineModel(Operator, ImportHelper):
         default=False,
         options={'SKIP_SAVE'},
     )
+    import_shape_keys: BoolProperty(
+        name="Import Shape Keys",
+        description="Import Morph2 targets and bake named Ziva channels into ordinary Blender shape keys",
+        default=True,
+        options={'SKIP_SAVE'},
+    )
 
     def draw(self, context):
         self.layout.prop(self, "import_all_lods")
+        self.layout.prop(self, "import_shape_keys")
 
     def _resolve_filepaths(self):
         paths = []
@@ -426,6 +486,11 @@ class ImportEngineModel(Operator, ImportHelper):
 
         wm.progress_update(5)
         import_all_lods = bool(getattr(self, "import_all_lods", False))
+        import_shape_keys = bool(getattr(self, "import_shape_keys", True))
+        has_morphs = BLOCK_HASHES.get("ModelAnimMorph2Info") in blocks
+        morph = decode_model_morph2(data, blocks) if import_shape_keys and has_morphs else None
+        has_ziva = BLOCK_HASHES.get("ModelAnimZiva2Info") in blocks
+        ziva_model = load_ziva_model(filepath) if has_ziva else None
         lod0_subset_ids = _collect_model_lod_subset_ids(_parse_model_looks_metadata(data, blocks), 0)
         has_skeleton = all(
             BLOCK_HASHES[name] in blocks
@@ -439,6 +504,11 @@ class ImportEngineModel(Operator, ImportHelper):
                 source_had_stg = src.read(4) == b"STG\x00"
         except OSError:
             pass
+
+        # MODEL assets are expected to carry the 48-byte STG wrapper. Reset
+        # this model-export setting on every import so an older .blend or an
+        # already-open scene cannot silently keep exporting raw DAT1.
+        context.scene.engine_export_add_stg_header = True
 
         mpu = 1.0
         if BLOCK_HASHES["ModelSubset"] in blocks:
@@ -508,6 +578,7 @@ class ImportEngineModel(Operator, ImportHelper):
         bpy.ops.object.mode_set(mode='OBJECT')
         for i, joint in enumerate(joints):
             arm.data.bones[joint['blender_name']]["engine_joint_index"] = i
+            arm.data.bones[joint['blender_name']]["engine_joint_name"] = joint['name']
         arm["engine_mpu"] = mpu
         arm["engine_model_static"] = not has_skeleton
         _store_model_metadata(
@@ -524,6 +595,20 @@ class ImportEngineModel(Operator, ImportHelper):
         arm["engine_model_import_all_lods"] = bool(import_all_lods)
         arm["engine_model_import_mode"] = "ALL_LODS" if import_all_lods else "LOD0"
         arm["engine_model_imported_subset_count"] = 0
+        arm["engine_model_source_has_morphs"] = bool(has_morphs)
+        arm["engine_model_source_has_ziva"] = bool(has_ziva)
+        arm["engine_model_shape_keys_imported"] = False
+        arm["engine_model_ziva_shape_keys_imported"] = False
+        arm["engine_model_imported_ziva_key_count"] = 0
+        arm["engine_model_ziva_shape_keys_imported"] = False
+        arm["engine_model_imported_ziva_key_count"] = 0
+        arm["engine_model_morph_search"] = ""
+        arm["engine_ziva_mode"] = "SOURCE_ZIVA" if has_ziva else "NONE"
+        arm["engine_ziva_metadata_json"] = json.dumps(
+            ziva_model.metadata() if ziva_model is not None else {},
+            separators=(",", ":"),
+            sort_keys=True,
+        )
 
         wm.progress_update(30)
 
@@ -533,6 +618,7 @@ class ImportEngineModel(Operator, ImportHelper):
             subset_count = s_size // MODEL_SUBSET_RECORD_SIZE
             joint_names_list = [j['blender_name'] for j in joints]
             imported_subset_count = 0
+            subset_objects = {}
 
             for s in range(subset_count):
                 wm.progress_update(30 + int(65 * (s / max(1, subset_count))))
@@ -626,7 +712,9 @@ class ImportEngineModel(Operator, ImportHelper):
                     engine_normal = _decode_packed_normal(raw_vertex[4])
                     vertex_normals.append((engine_normal[0], -engine_normal[2], engine_normal[1]))
                     position_ws.append(int(raw_vertex[3]))
-                me.normals_split_custom_set([vertex_normals[int(index)] for index in loop_vertex_indices])
+                me.normals_split_custom_set([
+                    vertex_normals[int(mesh_loop.vertex_index)] for mesh_loop in me.loops
+                ])
                 position_w_attr = me.attributes.new(name="engine_position_w", type='INT', domain='POINT')
                 position_w_attr.data.foreach_set("value", position_ws)
 
@@ -645,6 +733,12 @@ class ImportEngineModel(Operator, ImportHelper):
                 obj["engine_uv0_present"] = True
                 obj["engine_uv1_present"] = bool(subset_flags & SUBSET_FLAG_HAS_UV1)
                 obj["engine_uv2_present"] = bool(subset_flags & SUBSET_FLAG_HAS_UV2)
+                if ziva_model is not None and s < len(ziva_model.subsets):
+                    ziva_subset = ziva_model.subsets[s]
+                    obj["engine_ziva_source_mapped"] = ziva_subset["elem_index"] != ZIVA_INVALID_ELEM
+                    if ziva_subset["elem_index"] != ZIVA_INVALID_ELEM:
+                        obj["engine_ziva_element_index"] = int(ziva_subset["elem_index"])
+                subset_objects[int(s)] = obj
                 obj.parent = arm
                 if has_skeleton:
                     mod = obj.modifiers.new(type='ARMATURE', name="Armature")
@@ -701,10 +795,49 @@ class ImportEngineModel(Operator, ImportHelper):
                 imported_subset_count += 1
             arm["engine_model_imported_subset_count"] = int(imported_subset_count)
 
+            imported_morph_keys = 0
+            if morph is not None:
+                imported_morph_keys = _import_morph_shape_keys(morph, subset_objects, arm, wm=wm)
+            imported_ziva_keys = 0
+            if import_shape_keys and ziva_model is not None and ziva_model.sliders:
+                ziva_objects = [
+                    obj for obj in subset_objects.values()
+                    if bool(obj.get("engine_ziva_source_mapped", False))
+                ]
+                if ziva_objects:
+                    wm.progress_update(95)
+                    ziva_result = transfer_ziva_channels_to_objects(
+                        ziva_model,
+                        arm,
+                        ziva_objects,
+                        max_distance=0.001,
+                        lod=None if import_all_lods else 0,
+                        progress=lambda current, total, channel: wm.progress_update(
+                            95 + int(4 * (current / max(1, total)))
+                        ),
+                    )
+                    imported_ziva_keys = int(ziva_result["created"])
+                    arm["engine_ziva_mode"] = "CUSTOM_MORPH2"
+                    arm["engine_model_shape_keys_imported"] = True
+                    arm["engine_model_ziva_shape_keys_imported"] = True
+                    arm["engine_model_morph_target_count"] = int(len(ziva_model.sliders))
+            if imported_morph_keys or imported_ziva_keys:
+                sync_armature_morph_controls(arm)
+            arm["engine_model_imported_morph_key_count"] = int(imported_morph_keys)
+            arm["engine_model_imported_ziva_key_count"] = int(imported_ziva_keys)
+
         arm.active_lod = 0
         update_lod_visibility(arm, context)
         wm.progress_update(100)
         mode_label = "all LODs" if import_all_lods else "LOD0"
         imported_count = int(arm.get("engine_model_imported_subset_count", 0))
-        self.report({'INFO'}, f"Imported model with {joint_count} joints, {imported_count} {mode_label} subset(s)")
+        morph_label = ""
+        if import_shape_keys and has_morphs:
+            morph_label = f", {int(arm.get('engine_model_imported_morph_key_count', 0))} shape-key instances"
+        elif import_shape_keys and has_ziva and ziva_model is not None and ziva_model.sliders:
+            morph_label = (
+                f", {int(arm.get('engine_model_imported_ziva_key_count', 0))} Ziva shape-key instances "
+                f"across {len(ziva_model.sliders)} shared controls"
+            )
+        self.report({'INFO'}, f"Imported model with {joint_count} joints, {imported_count} {mode_label} subset(s){morph_label}")
         return {'FINISHED'}

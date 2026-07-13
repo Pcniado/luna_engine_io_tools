@@ -295,6 +295,62 @@ def _draw_model_source_panel(layout, arm):
     if import_mode:
         label = "All LODs" if import_mode == "ALL_LODS" else "LOD0 Only"
         col.label(text=f"Imported: {label}")
+    if bool(arm.get("engine_model_source_has_morphs", False)):
+        if bool(arm.get("engine_model_shape_keys_imported", False)):
+            col.label(text=f"Deformations: Morph2 ({int(arm.get('engine_model_morph_target_count', 0))} targets)")
+        else:
+            col.label(text="Deformations: Morph2 not imported", icon='ERROR')
+    elif bool(arm.get("engine_model_source_has_ziva", False)):
+        if bool(arm.get("engine_model_ziva_shape_keys_imported", False)):
+            col.label(
+                text=(
+                    f"Deformations: Ziva baked to shape keys "
+                    f"({int(arm.get('engine_model_morph_target_count', 0))} controls)"
+                )
+            )
+        else:
+            col.label(text="Deformations: compiled Ziva")
+    else:
+        col.label(text="Deformations: none in source")
+
+
+def _draw_model_morph_panel(layout, context, arm):
+    controls = _json_list_idprop(arm, "engine_model_morph_controls_json")
+    source_has_deformations = bool(
+        arm.get("engine_model_source_has_morphs", False)
+        or arm.get("engine_model_source_has_ziva", False)
+    )
+    if not controls and not source_has_deformations:
+        return
+    if not _draw_model_foldout(layout, arm, "engine_model_show_morphs", "Shape Keys"):
+        return
+    setup = layout.box()
+    setup.label(text="Custom Mesh Blendshapes")
+    setup.operator(MODEL_OT_create_original_blendshape_names.bl_idname, icon='SHAPEKEY_DATA')
+    setup.label(text="Creates the original model's names on every mesh child of this armature.")
+
+    box = layout.box()
+    header = box.row(align=True)
+    header.label(text=f"Armature Shape Key Preview: {len(controls)}")
+    header.operator(MODEL_OT_sync_morph_controls.bl_idname, text="", icon='FILE_REFRESH')
+    if not controls:
+        box.label(text="Parent the custom meshes, then create the original blendshape names.")
+        return
+    box.prop(arm, "engine_model_morph_search", text="", icon='VIEWZOOM')
+    search = str(getattr(arm, "engine_model_morph_search", "") or "").strip().casefold()
+    filtered = [item for item in controls if search in str(item.get("name", "")).casefold()]
+    col = box.column(align=True)
+    previews = getattr(arm, "engine_model_morph_previews", None)
+    for item in filtered[:24]:
+        name = str(item.get("name", "Blendshape"))
+        mesh_count = int(item.get("mesh_count", 0))
+        preview_index = int(item.get("preview_index", -1))
+        if previews is not None and 0 <= preview_index < len(previews):
+            col.prop(previews[preview_index], "value", text=f"{name} ({mesh_count})", slider=True)
+    if len(filtered) > 24:
+        col.label(text=f"+{len(filtered) - 24} more; use search to narrow the list")
+    elif not filtered:
+        col.label(text="No matching deformation names.")
 
 
 def _draw_model_dat1_panel(layout, arm):
@@ -455,6 +511,8 @@ def _draw_model_export_panel(layout, context, arm):
     box.label(text="Export")
     col = box.column(align=True)
     col.prop(context.scene, "engine_export_add_stg_header", text="Add STG Header")
+    if bool(arm.get("engine_model_source_has_morphs", False)) and not bool(arm.get("engine_model_shape_keys_imported", False)):
+        col.prop(arm, "engine_model_discard_unimported_morphs", text="Discard Unimported Morph2")
     col.operator(MODEL_OT_export_with_model_settings.bl_idname, text="Export Model")
 
 
@@ -496,6 +554,7 @@ class ModelPanel(Panel):
         arm = _resolve_anim_armature(context)
         for title, drawer in (
             ("Source", lambda: _draw_model_source_panel(layout, arm)),
+            ("Deformations", lambda: _draw_model_morph_panel(layout, context, arm)),
             ("DAT1", lambda: _draw_model_dat1_panel(layout, arm)),
             ("Looks", lambda: _draw_model_look_panel(layout, context, arm)),
             ("Subset", lambda: _draw_model_selection_panel(layout, context, arm)),

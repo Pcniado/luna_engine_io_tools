@@ -6,6 +6,8 @@
 
 * **Model import**: Import one or more compiled `.model` files into Blender.
 * **Model export**: Export selected Blender model data back into the Luna Engine model format.
+* **Morph2 editing**: Import model Morph2 data as shape keys, share controls across subsets, and rebuild Morph2 on export.
+* **Ziva replacement tools**: Evaluate compiled Ziva2 rigs, transfer named channels to replacement topology, and capture joint-driven poses as editable Morph2 targets.
 * **Animation import**: Import `.animclip` files and apply them to an existing armature or camera.
 * **Animation export**: Export the selected armature or camera animation as an `.animclip` file.
 * **Camera animation support**: Work with camera clips as well as skeletal animation clips.
@@ -30,7 +32,10 @@ You can also copy the `luna_engine_io_tools` folder into Blender's add-ons direc
 1. Go to **File > Import > Luna Engine Model**.
 2. Select one or more `.model` files.
 3. Enable **Import All LODs** if you want lower-detail subsets too.
-4. Click **Import**.
+4. Keep **Import Shape Keys** enabled when you want to preserve or edit model deformations.
+5. Click **Import**.
+
+For custom meshes replacing a fixed-topology Ziva model, see [ZIVA_WORKFLOW.md](ZIVA_WORKFLOW.md).
 
 ### Exporting models
 

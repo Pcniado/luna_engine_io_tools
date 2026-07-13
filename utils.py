@@ -71,13 +71,15 @@ try:
     import bpy
     from bpy_extras.io_utils import ImportHelper, ExportHelper
     from bpy.props import StringProperty, IntProperty, FloatProperty, BoolProperty, EnumProperty, PointerProperty, CollectionProperty
-    from bpy.types import Operator, Panel, OperatorFileListElement
+    from bpy.types import Operator, Panel, PropertyGroup, OperatorFileListElement
 except Exception:
     def _property_stub(*_args, **_kwargs):
         return None
     class Operator:
         pass
     class Panel:
+        pass
+    class PropertyGroup:
         pass
     class ImportHelper:
         pass
@@ -261,13 +263,7 @@ def _resolve_anim_action(arm):
 
 
 def resolve_subset_index_collisions(arm):
-    """Scan all mesh children of *arm* and reassign any duplicate engine_subset_index values.
-
-    When a static mesh is parented under a skeletal model armature, both may
-    have Subset_0 with engine_subset_index=0.  This function detects duplicates
-    and gives the later-encountered duplicate a new unique index so that every
-    child mesh has a distinct engine_subset_index.
-    """
+   
     seen = {}          # subset_id -> first object that claimed it
     used_ids = set()
     duplicates = []    # objects that need reassignment
@@ -344,7 +340,6 @@ def _unique_ints(values, valid=None):
 
 
 def sanitize_model_look_metadata(arm, mark_modified=False):
-    """Remove Look/LookGroup references to mesh subsets or looks that no longer exist."""
     if not arm:
         return False
 

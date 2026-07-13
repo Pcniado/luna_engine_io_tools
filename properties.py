@@ -18,7 +18,7 @@ _LUNA_SCENE_SETTING_SPECS = (
     ("engine_export_frame_start", int, 0),
     ("engine_export_frame_end", int, 0),
     ("engine_export_duration", float, 0.0),
-    ("engine_export_add_stg_header", bool, False),
+    ("engine_export_add_stg_header", bool, True),
     ("engine_export_use_original_values", bool, True),
     ("engine_export_looping", bool, False),
     ("engine_export_additive", bool, False),
@@ -509,6 +509,56 @@ def _model_look_group_items(self, context):
         items.append((str(index), name, f"Look group {index}, looks: {look_count}"))
     return items
 
+
+def _ziva_channel_items(self, context):
+    try:
+        metadata = json.loads(str(self.get("engine_ziva_metadata_json", "{}") or "{}"))
+    except Exception:
+        metadata = {}
+    channels = metadata.get("channels", []) if isinstance(metadata, dict) else []
+    items = []
+    for index, channel in enumerate(channels):
+        name = str(channel.get("name", "") or f"Channel {index}")
+        kind = str(channel.get("kind", "MORPH") or "MORPH")
+        driver = str(channel.get("driver_status", "") or "")
+        description = f"{kind.title()} Ziva channel"
+        if driver in {"GAME_BRIDGE_REQUIRED", "EXTERNAL"}:
+            description += "; requires game code to bridge the old Ziva track into Morph2"
+        items.append((str(index), name, description))
+    return items or [("NONE", "No named channels", "This Ziva rig has no named slider channels")]
+
+
+def _update_model_morph_preview(self, context):
+    arm = getattr(self, "id_data", None)
+    if arm is None or getattr(arm, "type", None) != 'ARMATURE':
+        return
+    target_name = str(getattr(self, "target_name", "") or "")
+    if not target_name:
+        return
+    value = float(getattr(self, "value", 0.0))
+    for obj in bpy.data.objects:
+        if obj.type != 'MESH' or obj.parent != arm:
+            continue
+        shape_keys = getattr(obj.data, "shape_keys", None)
+        key = shape_keys.key_blocks.get(target_name) if shape_keys else None
+        if key is not None:
+            key.value = value
+
+
+class MODEL_PG_morph_preview(PropertyGroup):
+    target_name: StringProperty(name="Blendshape Name", default="")
+    mesh_count: IntProperty(name="Mesh Count", min=0, default=0)
+    value: FloatProperty(
+        name="Preview Value",
+        description="Set the matching ordinary Blender shape-key value on every mesh under this armature",
+        min=-1.0,
+        max=1.0,
+        soft_min=0.0,
+        soft_max=1.0,
+        default=0.0,
+        update=_update_model_morph_preview,
+    )
+
 def update_smoothness(self, context):
     scene = context.scene
     base_fps = getattr(scene, "engine_anim_fps", scene.get("engine_base_fps", 30.0))
@@ -530,6 +580,10 @@ def update_smoothness(self, context):
 
 
 def register_properties():
+    bpy.types.Object.engine_model_morph_previews = CollectionProperty(
+        name="Armature Shape Key Preview",
+        type=MODEL_PG_morph_preview,
+    )
     bpy.types.Object.active_lod = IntProperty(
         name="Active LOD", min=0, max=7, default=0, update=update_lod_visibility
     )
@@ -561,6 +615,47 @@ def register_properties():
         name="DAT1",
         description="Show imported DAT1 metadata in the Model panel",
         default=False,
+    )
+    bpy.types.Object.engine_model_show_morphs = BoolProperty(
+        name="Deformations",
+        description="Show model-level Morph2 and transferred Ziva controls",
+        default=True,
+    )
+    bpy.types.Object.engine_model_morph_search = StringProperty(
+        name="Search Deformations",
+        description="Filter model-level deformation controls by name",
+        default="",
+    )
+    bpy.types.Object.engine_model_discard_unimported_morphs = BoolProperty(
+        name="Discard Unimported Morph2",
+        description="Deliberately remove source Morph2 data when it was not imported as shape keys",
+        default=False,
+    )
+    bpy.types.Object.engine_ziva_active_channel = EnumProperty(
+        name="Ziva Channel",
+        description="Named compiled Ziva channel to transfer into editable Morph2 shape keys",
+        items=_ziva_channel_items,
+    )
+    bpy.types.Object.engine_ziva_transfer_distance = FloatProperty(
+        name="Surface Distance",
+        description="Maximum rest-surface distance used when mapping replacement vertices to the source Ziva mesh",
+        subtype='DISTANCE',
+        min=0.0001,
+        max=10.0,
+        default=0.05,
+        precision=4,
+    )
+    bpy.types.Object.engine_ziva_overwrite_targets = BoolProperty(
+        name="Overwrite Existing",
+        description="Replace existing same-named registered deformation targets",
+        default=False,
+    )
+    bpy.types.Object.engine_ziva_element_index = IntProperty(
+        name="Ziva Element",
+        description="Compiled source Ziva element whose deformation surface drives this replacement mesh",
+        min=0,
+        max=254,
+        default=0,
     )
     bpy.types.Object.engine_model_show_look_groups = BoolProperty(
         name="Look Groups",
@@ -608,7 +703,7 @@ def register_properties():
         update=update_export_duration,
     )
     bpy.types.Scene.engine_export_add_stg_header = BoolProperty(
-        name="Add STG Header", default=False, update=update_luna_scene_setting
+        name="Add STG Header", default=True, update=update_luna_scene_setting
     )
     bpy.types.Scene.engine_export_use_original_values = BoolProperty(
         name="Use Original File Values",
@@ -671,9 +766,17 @@ def unregister_properties():
         (bpy.types.Scene, "engine_anim_fps"),
         (bpy.types.Scene, "use_smooth_playback"),
         (bpy.types.Object, "engine_model_show_blocks"),
+        (bpy.types.Object, "engine_model_morph_previews"),
         (bpy.types.Object, "engine_model_show_looks"),
+        (bpy.types.Object, "engine_ziva_element_index"),
+        (bpy.types.Object, "engine_ziva_overwrite_targets"),
+        (bpy.types.Object, "engine_ziva_transfer_distance"),
+        (bpy.types.Object, "engine_ziva_active_channel"),
+        (bpy.types.Object, "engine_model_discard_unimported_morphs"),
         (bpy.types.Object, "engine_model_show_look_groups"),
         (bpy.types.Object, "engine_model_show_dat1"),
+        (bpy.types.Object, "engine_model_morph_search"),
+        (bpy.types.Object, "engine_model_show_morphs"),
         (bpy.types.Object, "engine_model_preview_all_subsets"),
         (bpy.types.Object, "engine_model_use_look_group"),
         (bpy.types.Object, "engine_model_active_look_group"),

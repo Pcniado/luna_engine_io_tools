@@ -2,6 +2,7 @@ from .utils import *
 from .constants import SUBSET_CENTER_LOG_SCALE
 from .dat1 import DAT1_BLOCK_TABLE_ENTRY_SIZE, DAT1_FILE_ID, DAT1_FIXUP_TABLE_ENTRY_SIZE, DAT1_HEADER_SIZE
 from .hashes import BLOCK_HASHES, string_crc32
+from .model_morph import MORPH_DELTA_PRECISION, decode_model_morph2, encode_model_morph2, encode_model_smooth2
 from .model_import import (
     MODEL_MATERIAL_INFO_SIZE,
     MODEL_MATERIAL_SIZE,
@@ -67,6 +68,7 @@ MODEL_FLAG_USES_AUTO_LODS = 1 << 30
 SKIN_JOINT_OFFSET_STEP = 256
 SKIN_JOINT_OFFSET_MAX = SKIN_JOINT_OFFSET_STEP * 15
 SKIN_UINT8_MAX = 255
+SKIN_CLUSTER_ANIM_VERT_BIT = 1 << 29
 
 MODEL_BUILT_FLAGS_OFFSET = 0
 MODEL_BUILT_FADE_OUT_DIST_OFFSET = 24
@@ -75,8 +77,14 @@ MODEL_BUILT_AABB_EXTENTS_OFFSET = 48
 MODEL_BUILT_COMMON_MPU_OFFSET = 60
 MODEL_BUILT_VERTEX_MPU_OFFSET = 64
 MODEL_BUILT_CUSTOM_STREAM_COUNT_OFFSET = 68
+MODEL_BUILT_CONTENT_FLAGS_OFFSET = 72
 MODEL_BUILT_SUBSET_LOD_MASK_COUNT_OFFSET = 74
 MODEL_BUILT_STRAND_SUBSET_COUNT_OFFSET = 78
+
+CONTENT_FLAG_ANIM_MORPH = 0x0001
+CONTENT_FLAG_ANIM_ZIVA = 0x0004
+CONTENT_FLAG_ANIM_VERT_SMOOTH = 0x0010
+CONTENT_FLAG_USES_AUTO_LODS = 0x0080
 
 MODEL_SUBSET_SURFACE_AREA_OFFSET = 32
 MODEL_SUBSET_UV_AREA_OFFSET = 36
@@ -472,7 +480,9 @@ def _build_material_block(material_entries, string_pool):
         info_bytes += struct.pack("<IIII", path_offset, 0, mapping_offset, 0)
     for index, entry in enumerate(material_entries):
         mapping = str(entry.get("mapping", "") or "")
-        mapping_hash = string_crc32(mapping) if mapping else int(entry.get("mapping_hash", 0)) & U32_MASK
+        mapping_hash = int(entry.get("mapping_hash", 0)) & U32_MASK
+        if mapping_hash == 0 and mapping:
+            mapping_hash = string_crc32(mapping)
         material_id = int(entry.get("id", 0)) & U64_MASK
         if material_id == 0:
             material_id = _valid_material_id(index)
@@ -700,7 +710,136 @@ def _vertex_weights(mesh_vertex, obj, group_to_joint, source_joint_count):
     return weights[:12]
 
 
-def _export_mesh_vertices(obj, arm, source_joint_count, original_flags=0, export_warnings=None):
+def _shape_key_export_data(obj, linear_matrix):
+    mesh = obj.data
+    shape_keys = getattr(mesh, "shape_keys", None)
+    key_blocks = list(getattr(shape_keys, "key_blocks", []) or [])
+    if not key_blocks:
+        return None, []
+    vertex_count = len(mesh.vertices)
+    for key in key_blocks:
+        if len(key.data) != vertex_count:
+            raise ValueError(
+                f"{obj.name}: shape key {key.name!r} has {len(key.data)} points, expected {vertex_count}"
+            )
+
+    basis_coords = np.empty(vertex_count * 3, dtype=np.float64)
+    key_blocks[0].data.foreach_get("co", basis_coords)
+    basis_coords = basis_coords.reshape((-1, 3))
+    if len(key_blocks) == 1:
+        return basis_coords, []
+
+    try:
+        metadata = json.loads(str(obj.get("engine_morph_targets_json", "{}") or "{}"))
+    except Exception:
+        metadata = {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    transform = np.array(
+        [[float(linear_matrix[row][column]) for column in range(3)] for row in range(3)],
+        dtype=np.float64,
+    )
+    targets = []
+    for key in key_blocks[1:]:
+        # Once a mesh has imported/transferred engine metadata, only registered
+        # targets are exportable.  This prevents unrelated corrective or helper
+        # shape keys from silently becoming game-visible Morph2 channels.
+        if metadata and str(key.name) not in metadata:
+            continue
+        key_coords = np.empty(vertex_count * 3, dtype=np.float64)
+        key.data.foreach_get("co", key_coords)
+        blender_deltas = key_coords.reshape((-1, 3)) - basis_coords
+        armature_deltas = blender_deltas @ transform.T
+        engine_deltas = np.empty_like(armature_deltas)
+        engine_deltas[:, 0] = armature_deltas[:, 0]
+        engine_deltas[:, 1] = armature_deltas[:, 2]
+        engine_deltas[:, 2] = -armature_deltas[:, 1]
+        affected = np.flatnonzero(np.linalg.norm(engine_deltas, axis=1) >= MORPH_DELTA_PRECISION)
+        if not len(affected):
+            continue
+
+        stored = metadata.get(str(key.name))
+        if isinstance(stored, dict) and stored.get("name"):
+            target_name = str(stored["name"])
+            target_hash = int(stored.get("hash", string_crc32(target_name))) & U32_MASK
+            source_target_index = int(stored.get("index", -1))
+        else:
+            target_name = str(key.name)
+            target_hash = string_crc32(target_name)
+            source_target_index = -1
+        targets.append({
+            "name": target_name,
+            "hash": target_hash,
+            "source_index": source_target_index,
+            "source_deltas": {
+                int(index): tuple(float(component) for component in engine_deltas[index])
+                for index in affected
+            },
+        })
+    return basis_coords, targets
+
+
+def _finalize_export_morph_topology(vertices, indices, source_targets):
+    targets = []
+    affected_vertices = set()
+    for target in source_targets:
+        source_deltas = target["source_deltas"]
+        deltas = {}
+        for export_index, vertex in enumerate(vertices):
+            delta = source_deltas.get(int(vertex["source_index"]))
+            if delta is not None:
+                deltas[export_index] = delta
+        if deltas:
+            targets.append({
+                "name": target["name"],
+                "hash": target["hash"],
+                "source_index": target.get("source_index", -1),
+                "deltas": deltas,
+            })
+            affected_vertices.update(deltas)
+    if not affected_vertices:
+        return vertices, indices, targets, 0
+
+    order = sorted(affected_vertices) + [index for index in range(len(vertices)) if index not in affected_vertices]
+    remap = {old_index: new_index for new_index, old_index in enumerate(order)}
+    reordered_vertices = [vertices[old_index] for old_index in order]
+    reordered_indices = [remap[int(index)] for index in indices]
+    for target in targets:
+        target["deltas"] = {remap[index]: delta for index, delta in target["deltas"].items()}
+    return reordered_vertices, reordered_indices, targets, len(affected_vertices)
+
+
+def _order_export_vertices_by_control_point(vertices, indices, control_vertex_count):
+  
+    primary = {}
+    duplicates = []
+    for old_index, vertex in enumerate(vertices):
+        source_index = int(vertex.get("source_index", -1))
+        if 0 <= source_index < int(control_vertex_count) and source_index not in primary:
+            primary[source_index] = old_index
+        else:
+            duplicates.append(old_index)
+    if len(primary) != int(control_vertex_count):
+        # Preserve established behavior for malformed meshes containing unused
+        # control points; they cannot safely satisfy direct Luna vertex IDs.
+        return vertices, indices
+    order = [primary[index] for index in range(int(control_vertex_count))]
+    order.extend(sorted(duplicates, key=lambda index: (int(vertices[index].get("source_index", -1)), index)))
+    if order == list(range(len(vertices))):
+        return vertices, indices
+    remap = {old_index: new_index for new_index, old_index in enumerate(order)}
+    return [vertices[index] for index in order], [remap[int(index)] for index in indices]
+
+
+def _export_mesh_vertices(
+    obj,
+    arm,
+    source_joint_count,
+    original_flags=0,
+    export_warnings=None,
+    fallback_morph_targets=None,
+):
     mesh = obj.data
     uv_info = _ensure_model_uv_layers(obj, export_warnings)
     mesh.calc_loop_triangles()
@@ -717,6 +856,17 @@ def _export_mesh_vertices(obj, arm, source_joint_count, original_flags=0, export
         normal_matrix = linear_matrix
     transform_handedness = -1.0 if linear_matrix.determinant() < 0.0 else 1.0
     group_to_joint = _vertex_group_joint_map(obj, arm)
+    basis_coords, source_morph_targets = _shape_key_export_data(obj, linear_matrix)
+    if not source_morph_targets and fallback_morph_targets:
+        source_morph_targets = [
+            {
+                "name": str(target["name"]),
+                "hash": int(target["hash"]) & U32_MASK,
+                "source_index": int(target.get("source_index", target.get("index", -1))),
+                "deltas": {int(index): tuple(delta) for index, delta in target.get("deltas", {}).items()},
+            }
+            for target in fallback_morph_targets
+        ]
 
     if not uv0_layer:
         raise ValueError(f"{obj.name}: UV0 is required to calculate Luna tangent space")
@@ -795,7 +945,11 @@ def _export_mesh_vertices(obj, arm, source_joint_count, original_flags=0, export
                     break
             if export_index is None:
                 vertex = mesh.vertices[source_vertex_index]
-                co = matrix @ vertex.co
+                source_co = (
+                    mathutils.Vector(basis_coords[source_vertex_index])
+                    if basis_coords is not None else vertex.co
+                )
+                co = matrix @ source_co
                 export_index = len(export_vertices)
                 vertex_buckets.setdefault(source_vertex_index, []).append(export_index)
                 export_vertices.append({
@@ -835,7 +989,18 @@ def _export_mesh_vertices(obj, arm, source_joint_count, original_flags=0, export
             vertex.pop("extrusion_encoded"),
         )
 
-    return export_vertices, indices, bool(has_uv1), bool(has_uv2)
+    export_vertices, indices = _order_export_vertices_by_control_point(
+        export_vertices,
+        indices,
+        len(mesh.vertices),
+    )
+
+    export_vertices, indices, morph_targets, anim_vert_count = _finalize_export_morph_topology(
+        export_vertices,
+        indices,
+        source_morph_targets,
+    )
+    return export_vertices, indices, bool(has_uv1), bool(has_uv2), morph_targets, anim_vert_count
 
 
 def _split_export_vertex_chunks(vertices, indices, max_vertices=MODEL_SPLIT_VERTEX_TARGET):
@@ -1079,12 +1244,12 @@ def _serialize_cluster_skin_data(prepared, is_16bit, joint_count_max):
     return bytes(cluster_bytes)
 
 
-def _build_skin_sections(vertices, force_skin):
+def _build_skin_sections(vertices, force_skin, anim_cluster_count=0):
     if not force_skin:
         return b"", b""
     skin_data = bytearray()
     cluster_headers = bytearray()
-    for cluster_start in range(0, len(vertices), SKIN_CLUSTER_VERTEX_COUNT):
+    for cluster_index, cluster_start in enumerate(range(0, len(vertices), SKIN_CLUSTER_VERTEX_COUNT)):
         cluster_vertices = vertices[cluster_start:cluster_start + SKIN_CLUSTER_VERTEX_COUNT]
         normalized_weights = [_normalize_skin_weights(vertex.get("weights", [])) for vertex in cluster_vertices]
         influence_count = max(1, min(12, max(len(weights) for weights in normalized_weights)))
@@ -1108,6 +1273,8 @@ def _build_skin_sections(vertices, force_skin):
             header |= SKIN_CLUSTER_FULL_INDEX_BIT
         else:
             header |= (joint_offset // SKIN_JOINT_OFFSET_STEP) << SKIN_CLUSTER_JOINT_OFFSET_SHIFT
+        if cluster_index < int(anim_cluster_count):
+            header |= SKIN_CLUSTER_ANIM_VERT_BIT
         cluster_headers += struct.pack("<I", header)
         skin_data += _serialize_cluster_skin_data(prepared, is_16bit, joint_count_max)
     return bytes(skin_data), bytes(cluster_headers)
@@ -1187,7 +1354,18 @@ def _subset_bounds(vertices, mpu):
     return center, extents, radius, origin_units, origin_packed, extents_word, needs_origin
 
 
-def _build_subset_geometry_from_data(obj, arm, material_index, original_record, custom_stream_index, vertices, indices, has_uv1, has_uv2):
+def _build_subset_geometry_from_data(
+    obj,
+    arm,
+    material_index,
+    original_record,
+    custom_stream_index,
+    vertices,
+    indices,
+    has_uv1,
+    has_uv2,
+    anim_vert_count=0,
+):
     original_flags = 0
     if original_record:
         original_flags = struct.unpack_from("<H", original_record, MODEL_SUBSET_FLAGS_OFFSET)[0]
@@ -1258,7 +1436,11 @@ def _build_subset_geometry_from_data(obj, arm, material_index, original_record, 
                 f"(source vertex indices: {sample}{suffix}). Assign weights before export; Luna cannot "
                 "safely bind missing weights to joint 0."
             )
-    skin_data, cluster_headers = _build_skin_sections(vertices, force_skin)
+    anim_vert_count = int(anim_vert_count)
+    if not 0 <= anim_vert_count <= len(vertices):
+        raise ValueError(f"{obj.name}: invalid AnimVert count {anim_vert_count}")
+    anim_cluster_count = _align(anim_vert_count, SKIN_CLUSTER_VERTEX_COUNT) // SKIN_CLUSTER_VERTEX_COUNT
+    skin_data, cluster_headers = _build_skin_sections(vertices, force_skin, anim_cluster_count)
     vertex_skin_offset = 0
     skin_cluster_offset = 0
     if force_skin:
@@ -1295,6 +1477,8 @@ def _build_subset_geometry_from_data(obj, arm, material_index, original_record, 
         flags |= SUBSET_FLAG_HAS_UV1
     if has_uv2:
         flags |= SUBSET_FLAG_HAS_UV2
+    if anim_vert_count:
+        flags |= SUBSET_FLAG_HAS_ANIM_VERT
     if needs_origin:
         flags |= SUBSET_FLAG_HAS_ORIGIN_OFFSET
 
@@ -1329,8 +1513,8 @@ def _build_subset_geometry_from_data(obj, arm, material_index, original_record, 
     struct.pack_into("<I", record, 84, custom_stream_index)
     struct.pack_into("<I", record, MODEL_SUBSET_BASE_OFFSET, 0)
     struct.pack_into("<I", record, 92, len(geom))
-    struct.pack_into("<I", record, 96, 0)
-    struct.pack_into("<H", record, 100, 0)
+    struct.pack_into("<I", record, 96, anim_vert_count)
+    struct.pack_into("<H", record, 100, anim_cluster_count)
     struct.pack_into("<H", record, 102, 1)
     struct.pack_into("<H", record, MODEL_SUBSET_LONGEST_EDGE_OFFSET, _clamp_u16(longest_edge / max(mpu, 1e-9)))
 
@@ -1343,21 +1527,33 @@ def _build_subset_geometry_from_data(obj, arm, material_index, original_record, 
         "extents": extents,
         "radius": radius,
         "mpu": mpu,
+        "anim_vert_count": anim_vert_count,
+        "anim_cluster_count": anim_cluster_count,
+        "vertices": vertices,
     }
     return bytes(record), bytes(geom), stats
 
 
-def _build_subset_geometry_chunks(obj, arm, material_index, original_record, source_joint_count, export_warnings=None):
+def _build_subset_geometry_chunks(
+    obj,
+    arm,
+    material_index,
+    original_record,
+    source_joint_count,
+    export_warnings=None,
+    fallback_morph_targets=None,
+):
     original_flags = 0
     if original_record:
         original_flags = struct.unpack_from("<H", original_record, MODEL_SUBSET_FLAGS_OFFSET)[0]
 
-    vertices, indices, has_uv1, has_uv2 = _export_mesh_vertices(
+    vertices, indices, has_uv1, has_uv2, morph_targets, anim_vert_count = _export_mesh_vertices(
         obj,
         arm,
         source_joint_count,
         original_flags=original_flags,
         export_warnings=export_warnings,
+        fallback_morph_targets=fallback_morph_targets,
     )
     if not vertices or not indices:
         raise ValueError(f"{obj.name}: mesh has no triangles to export")
@@ -1367,10 +1563,18 @@ def _build_subset_geometry_chunks(obj, arm, material_index, original_record, sou
             f"{MODEL_MAX_VERTEX_COUNT}. Please split this mesh into smaller submeshes before export. "
             "Automatic bigger-submesh splitting may be added later."
         )
-    return [(vertices, indices, has_uv1, has_uv2)]
+    return [(vertices, indices, has_uv1, has_uv2, morph_targets, anim_vert_count)]
 
 
-def _build_geometry_and_subset_blocks(mesh_objects, arm, material_indices, template, source_joint_count, export_warnings=None):
+def _build_geometry_and_subset_blocks(
+    mesh_objects,
+    arm,
+    material_indices,
+    template,
+    source_joint_count,
+    export_warnings=None,
+    source_morph_targets_by_subset=None,
+):
     subset_block_hash = BLOCK_HASHES["ModelSubset"]
     original_subset_block = template.payload(subset_block_hash) if subset_block_hash in template.blocks else b""
     original_count = len(original_subset_block) // MODEL_SUBSET_RECORD_SIZE
@@ -1379,6 +1583,7 @@ def _build_geometry_and_subset_blocks(mesh_objects, arm, material_indices, templ
     geom_buffer = bytearray()
     stats = []
     subset_index_map = {}
+    morph_targets_by_name = {}
     custom_stream_index = 0
     for index, obj in enumerate(mesh_objects):
         original_record = b""
@@ -1398,9 +1603,10 @@ def _build_geometry_and_subset_blocks(mesh_objects, arm, material_indices, templ
             original_record,
             source_joint_count,
             export_warnings=export_warnings,
+            fallback_morph_targets=(source_morph_targets_by_subset or {}).get(int(old_index), []),
         )
         mapped_indices = []
-        for chunk_vertices, chunk_indices, has_uv1, has_uv2 in chunks:
+        for chunk_vertices, chunk_indices, has_uv1, has_uv2, chunk_morph_targets, anim_vert_count in chunks:
             _align_buffer(geom_buffer, DAT1_BLOCK_ALIGN)
             geom_base = len(geom_buffer)
             record, geom, subset_stats = _build_subset_geometry_from_data(
@@ -1413,16 +1619,45 @@ def _build_geometry_and_subset_blocks(mesh_objects, arm, material_indices, templ
                 chunk_indices,
                 has_uv1,
                 has_uv2,
+                anim_vert_count=anim_vert_count,
             )
             record = bytearray(record)
             struct.pack_into("<I", record, MODEL_SUBSET_BASE_OFFSET, geom_base)
             geom_buffer += geom
-            mapped_indices.append(len(subset_records))
+            generated_subset_index = len(subset_records)
+            mapped_indices.append(generated_subset_index)
             subset_records.append(bytes(record))
+            subset_stats["indices"] = chunk_indices
+            subset_stats["source_subset_index"] = int(old_index)
             stats.append(subset_stats)
+            for target in chunk_morph_targets:
+                name = str(target["name"])
+                existing = morph_targets_by_name.get(name)
+                if existing is None:
+                    existing = {
+                        "name": name,
+                        "hash": int(target["hash"]) & U32_MASK,
+                        "source_index": int(target.get("source_index", -1)),
+                        "subsets": [],
+                    }
+                    morph_targets_by_name[name] = existing
+                elif int(existing["hash"]) != (int(target["hash"]) & U32_MASK):
+                    raise ValueError(f"Morph target {name!r} has inconsistent stored hashes across meshes")
+                elif int(existing.get("source_index", -1)) != int(target.get("source_index", -1)):
+                    raise ValueError(f"Morph target {name!r} has inconsistent source indices across meshes")
+                existing["subsets"].append({
+                    "subset_index": generated_subset_index,
+                    "deltas": target["deltas"],
+                })
             custom_stream_index += _align(subset_stats["custom_stream_count"], 2)
         subset_index_map[int(old_index)] = mapped_indices
-    return b"".join(subset_records), bytes(geom_buffer), stats, subset_index_map
+    return (
+        b"".join(subset_records),
+        bytes(geom_buffer),
+        stats,
+        subset_index_map,
+        list(morph_targets_by_name.values()),
+    )
 
 
 def _json_list_from_idprop(owner, key):
@@ -1823,7 +2058,7 @@ def _combine_model_bounds(source_bounds, subset_stats):
     return center, tuple(value + radius_padding for value in extents), radius + radius_padding
 
 
-def _build_model_built_block(template, subset_stats, arm=None):
+def _build_model_built_block(template, subset_stats, arm=None, has_morph=False):
     block_hash = BLOCK_HASHES["ModelBuilt"]
     original = bytearray(template.payload(block_hash) if block_hash in template.blocks else b"\x00" * MODEL_BUILT_SIZE)
     if len(original) < MODEL_BUILT_SIZE:
@@ -1832,9 +2067,22 @@ def _build_model_built_block(template, subset_stats, arm=None):
 
     flags = struct.unpack_from("<Q", model_built, MODEL_BUILT_FLAGS_OFFSET)[0]
     flags &= ~(MODEL_FLAG_ANIM_VERT | MODEL_FLAG_ANIM_DYNAMICS | MODEL_FLAG_USES_AUTO_LODS)
+    if has_morph:
+        flags |= MODEL_FLAG_ANIM_VERT
     if not any(stat.get("skinned") for stat in subset_stats):
         flags &= ~(MODEL_FLAG_HAS_SKINNING | MODEL_FLAG_HAS_GPU_SKINNING)
     struct.pack_into("<Q", model_built, MODEL_BUILT_FLAGS_OFFSET, flags)
+
+    content_flags = struct.unpack_from("<H", model_built, MODEL_BUILT_CONTENT_FLAGS_OFFSET)[0]
+    content_flags &= ~(
+        CONTENT_FLAG_ANIM_MORPH
+        | CONTENT_FLAG_ANIM_ZIVA
+        | CONTENT_FLAG_ANIM_VERT_SMOOTH
+        | CONTENT_FLAG_USES_AUTO_LODS
+    )
+    if has_morph:
+        content_flags |= CONTENT_FLAG_ANIM_MORPH | CONTENT_FLAG_ANIM_VERT_SMOOTH
+    struct.pack_into("<H", model_built, MODEL_BUILT_CONTENT_FLAGS_OFFSET, content_flags)
 
     source_bounds, source_common_mpu, source_vertex_mpu = _source_model_built_state(model_built, arm=arm)
 
@@ -1875,6 +2123,88 @@ def _build_model_built_block(template, subset_stats, arm=None):
     return bytes(model_built)
 
 
+def _source_morph_targets_for_older_scene(template, mesh_objects):
+    """Recover source Morph2 deltas when an older .blend has no imported keys."""
+    decoded = decode_model_morph2(template.data, template.blocks)
+    if not decoded:
+        return {}, 0
+    objects_by_subset = {}
+    for obj in mesh_objects:
+        try:
+            subset_index = int(obj.get("engine_subset_index", -1))
+        except Exception:
+            continue
+        if subset_index >= 0:
+            objects_by_subset.setdefault(subset_index, []).append(obj)
+
+    source_subset = template.payload(BLOCK_HASHES["ModelSubset"])
+    geom_base, _geom_size = template.blocks[BLOCK_HASHES["ModelSubsetGeomData"]]
+    source_subset_count = len(source_subset) // MODEL_SUBSET_RECORD_SIZE
+    result = {}
+    skipped_records = 0
+    for target in decoded.get("targets", []):
+        for target_subset in target.get("subsets", []):
+            subset_index = int(target_subset["subset_index"])
+            objects = objects_by_subset.get(subset_index, [])
+            if not objects:
+                skipped_records += 1
+                continue
+            if len(objects) != 1 or not 0 <= subset_index < source_subset_count:
+                raise ValueError(
+                    f"Cannot preserve source Morph2 target {target['name']!r}: subset {subset_index} "
+                    "does not map to exactly one imported mesh"
+                )
+            obj = objects[0]
+            mesh = obj.data
+            record_offset = subset_index * MODEL_SUBSET_RECORD_SIZE
+            source_index_count = struct.unpack_from("<I", source_subset, record_offset + MODEL_SUBSET_INDEX_COUNT_OFFSET)[0]
+            source_vertex_count = struct.unpack_from("<I", source_subset, record_offset + MODEL_SUBSET_VERTEX_COUNT_OFFSET)[0]
+            if len(mesh.vertices) != source_vertex_count:
+                raise ValueError(
+                    f"Cannot preserve source Morph2 target {target['name']!r}: {obj.name} has "
+                    f"{len(mesh.vertices)} control vertices, source subset {subset_index} has {source_vertex_count}. "
+                    "Re-import with Import Shape Keys enabled after topology changes."
+                )
+            subset_base = struct.unpack_from("<I", source_subset, record_offset + MODEL_SUBSET_BASE_OFFSET)[0]
+            index_offset = struct.unpack_from("<I", source_subset, record_offset + MODEL_SUBSET_INDEX_DATA_OFFSET)[0]
+            source_indices = list(struct.unpack_from(
+                f"<{source_index_count}H",
+                template.data,
+                geom_base + int(subset_base) + int(index_offset),
+            ))
+            source_triangles = sorted(
+                tuple(sorted(source_indices[index:index + 3]))
+                for index in range(0, len(source_indices), 3)
+                if len(source_indices[index:index + 3]) == 3
+            )
+            mesh.calc_loop_triangles()
+            current_triangles = sorted(
+                tuple(sorted(int(mesh.loops[loop_index].vertex_index) for loop_index in triangle.loops))
+                for triangle in mesh.loop_triangles
+            )
+            if current_triangles != source_triangles:
+                raise ValueError(
+                    f"Cannot preserve source Morph2 target {target['name']!r}: {obj.name} topology no longer "
+                    "matches its source subset. Re-import with Import Shape Keys enabled, or remove Morph2 deliberately."
+                )
+            deltas = {int(index): tuple(value) for index, value in target_subset.get("deltas", {}).items()}
+            if any(index < 0 or index >= source_vertex_count for index in deltas):
+                raise ValueError(f"Source Morph2 target {target['name']!r} contains an invalid vertex index")
+            result.setdefault(subset_index, []).append({
+                "name": str(target["name"]),
+                "hash": int(target["hash"]) & U32_MASK,
+                "source_index": int(target.get("index", -1)),
+                "deltas": deltas,
+            })
+    if not result:
+        raise ValueError(
+            "The source contains Morph2 targets, but none map to the meshes in this older scene. "
+            "Re-import with Import Shape Keys enabled."
+        )
+    return result, skipped_records
+
+
+
 def _build_inert_look_bvh_blocks(template):
     replacements = {}
     bvh_hash = BLOCK_HASHES.get("ModelLookBVHInfo")
@@ -1896,20 +2226,68 @@ def _block_alignment(block_hash):
     return DAT1_CACHELINE_ALIGN if block_hash in cacheline_blocks else DAT1_BLOCK_ALIGN
 
 
-def _rebuild_dat1(template, replacements, string_pool):
+def _relocate_model_string_offsets(block_hash, payload, delta):
+    """Relocate absolute DAT1 string pointers in serialized model blocks."""
+    if not delta or not payload:
+        return payload
+    data = bytearray(payload)
+    if block_hash == BLOCK_HASHES["ModelMaterial"]:
+        material_count = len(data) // (MODEL_MATERIAL_INFO_SIZE + MODEL_MATERIAL_SIZE)
+        for index in range(material_count):
+            base = index * MODEL_MATERIAL_INFO_SIZE
+            for field_offset in (0, 8):
+                value = struct.unpack_from("<I", data, base + field_offset)[0]
+                if value:
+                    struct.pack_into("<I", data, base + field_offset, value + delta)
+    elif block_hash == BLOCK_HASHES["ModelLookBuilt"]:
+        # Headers occupy the leading fixed-size record array; data sections
+        # follow. Infer the count from the first section offset.
+        look_count = 0
+        if len(data) >= MODEL_LOOK_BUILT_SIZE:
+            first_section = struct.unpack_from("<Q", data, 0)[0]
+            if first_section % MODEL_LOOK_BUILT_SIZE == 0:
+                look_count = min(len(data) // MODEL_LOOK_BUILT_SIZE, int(first_section // MODEL_LOOK_BUILT_SIZE))
+        for index in range(look_count):
+            field_offset = index * MODEL_LOOK_BUILT_SIZE + 76
+            value = struct.unpack_from("<I", data, field_offset)[0]
+            if value:
+                struct.pack_into("<I", data, field_offset, value + delta)
+    elif block_hash == BLOCK_HASHES["ModelLookGroup"]:
+        group_count = int(data[0]) if data else 0
+        for index in range(group_count):
+            field_offset = 1 + index * MODEL_LOOK_GROUP_SIZE + 20
+            if field_offset + 4 <= len(data):
+                value = struct.unpack_from("<I", data, field_offset)[0]
+                if value:
+                    struct.pack_into("<I", data, field_offset, value + delta)
+    return bytes(data)
+
+
+def _rebuild_dat1(template, replacements, string_pool, remove_hashes=None):
     if template.fixup_count != 0:
         raise ValueError("model export currently supports DAT1 files with zero fixups only")
 
+    remove_hashes = set(remove_hashes or ())
     physical_hashes = [
         entry[0]
         for entry in sorted(template.entries, key=lambda item: item[1])
+        if entry[0] not in remove_hashes
     ]
     geom_hash = BLOCK_HASHES["ModelSubsetGeomData"]
+    added_hashes = [
+        block_hash for block_hash in replacements
+        if block_hash not in physical_hashes and block_hash not in remove_hashes and block_hash != geom_hash
+    ]
     if geom_hash in physical_hashes:
-        physical_hashes = [h for h in physical_hashes if h != geom_hash] + [geom_hash]
+        physical_hashes = [h for h in physical_hashes if h != geom_hash] + sorted(added_hashes) + [geom_hash]
+    else:
+        physical_hashes.extend(sorted(added_hashes))
 
     strings = string_pool.bytes()
-    cursor = template.sb_offset + len(strings)
+    table_end = DAT1_HEADER_SIZE + len(physical_hashes) * DAT1_BLOCK_TABLE_ENTRY_SIZE + len(template.fixup_table)
+    string_base = max(template.sb_offset, table_end)
+    string_delta = string_base - template.sb_offset
+    cursor = string_base + len(strings)
     payload_by_hash = {}
     offset_by_hash = {}
     body = bytearray()
@@ -1918,6 +2296,8 @@ def _rebuild_dat1(template, replacements, string_pool):
         payload = replacements.get(block_hash)
         if payload is None:
             payload = template.payload(block_hash)
+        if string_delta:
+            payload = _relocate_model_string_offsets(block_hash, payload, string_delta)
         if block_hash == geom_hash:
             original_geom_offset, original_geom_size = template.blocks[geom_hash]
             if len(payload) < original_geom_size:
@@ -1940,9 +2320,14 @@ def _rebuild_dat1(template, replacements, string_pool):
         payload = payload_by_hash[block_hash]
         block_table_entries.append(struct.pack("<III", block_hash, offset_by_hash[block_hash], len(payload)))
     block_table = b"".join(block_table_entries)
-    declared_size = DAT1_HEADER_SIZE + len(block_table) + len(template.fixup_table) + len(strings) + len(body)
+    # Preserve the source string buffer's absolute DAT1 offset. Many model
+    # records store absolute string pointers, including records we otherwise
+    # byte-preserve. Removing a block-table entry must therefore leave padding
+    # instead of sliding every later payload toward the header.
+    header_padding = b"\x00" * max(0, string_base - table_end)
+    declared_size = DAT1_HEADER_SIZE + len(block_table) + len(template.fixup_table) + len(header_padding) + len(strings) + len(body)
     header = struct.pack("<IIIHH", DAT1_FILE_ID, template.version, declared_size, len(payload_by_hash), template.fixup_count)
-    out = header + block_table + template.fixup_table + strings + bytes(body)
+    out = header + block_table + template.fixup_table + header_padding + strings + bytes(body)
     return out, offset_by_hash.get(geom_hash, 0), len(payload_by_hash.get(geom_hash, b""))
 
 
@@ -2009,6 +2394,15 @@ class ExportEngineModel(Operator, ExportHelper):
             self.report({'ERROR'}, f"Could not read source model template: {exc}")
             return {'CANCELLED'}
 
+        source_has_morph = BLOCK_HASHES["ModelAnimMorph2Info"] in template.blocks
+        source_has_ziva = BLOCK_HASHES["ModelAnimZiva2Info"] in template.blocks
+        discard_unimported_morphs = bool(getattr(arm, "engine_model_discard_unimported_morphs", False))
+        recover_source_morph = (
+            source_has_morph
+            and not bool(arm.get("engine_model_shape_keys_imported", False))
+            and not discard_unimported_morphs
+        )
+
         required = ("ModelBuilt", "ModelMaterial", "ModelLook", "ModelLookGroup", "ModelLookBuilt", "ModelSubset", "ModelSubsetGeomData")
         missing = [name for name in required if BLOCK_HASHES[name] not in template.blocks]
         if missing:
@@ -2048,14 +2442,49 @@ class ExportEngineModel(Operator, ExportHelper):
                 source_joint_count = struct.unpack_from("<H", hierarchy, 2)[0] if len(hierarchy) >= 4 else None
             else:
                 source_joint_count = 0
-            subset_block, geom_block, subset_stats, subset_index_map = _build_geometry_and_subset_blocks(
+            source_morph_targets_by_subset = {}
+            if recover_source_morph:
+                try:
+                    source_morph_targets_by_subset, skipped_morph_subset_records = _source_morph_targets_for_older_scene(
+                        template,
+                        mesh_objects,
+                    )
+                except ValueError as exc:
+                    raise ValueError(
+                        f"{exc} To export this changed topology without facial morphs, enable "
+                        "Model > Export > Discard Unimported Morph2."
+                    ) from exc
+                export_warnings.append(
+                    "This older scene had no imported shape keys, so compatible source Morph2 targets were "
+                    "recovered and rebuilt automatically."
+                )
+                if skipped_morph_subset_records:
+                    export_warnings.append(
+                        f"Skipped {skipped_morph_subset_records} source Morph2 subset record(s) for meshes not "
+                        "present in this import mode."
+                    )
+            elif source_has_morph and discard_unimported_morphs:
+                export_warnings.append(
+                    "Discard Unimported Morph2 was enabled: source Morph2, Smooth, and AnimVert Info blocks "
+                    "were deliberately removed because this scene has no imported shape keys."
+                )
+
+            subset_block, geom_block, subset_stats, subset_index_map, morph_targets = _build_geometry_and_subset_blocks(
                 mesh_objects,
                 arm,
                 material_indices,
                 template,
                 source_joint_count,
                 export_warnings=export_warnings,
+                source_morph_targets_by_subset=source_morph_targets_by_subset,
             )
+            morph_info_block, morph_geom_suffix, morph_metadata = encode_model_morph2(
+                morph_targets,
+                len(geom_block),
+            )
+            has_morph = morph_info_block is not None
+            if has_morph:
+                geom_block += morph_geom_suffix
             material_block = _build_material_block(material_entries, string_pool)
             generated_subset_count = len(subset_stats)
             look_block, look_built_block, look_group_block = _build_look_blocks(
@@ -2065,7 +2494,7 @@ class ExportEngineModel(Operator, ExportHelper):
                 arm=arm,
                 subset_index_map=subset_index_map,
             )
-            model_built_block = _build_model_built_block(template, subset_stats, arm=arm)
+            model_built_block = _build_model_built_block(template, subset_stats, arm=arm, has_morph=has_morph)
 
             replacements = {
                 BLOCK_HASHES["ModelBuilt"]: model_built_block,
@@ -2076,10 +2505,37 @@ class ExportEngineModel(Operator, ExportHelper):
                 BLOCK_HASHES["ModelSubset"]: subset_block,
                 BLOCK_HASHES["ModelSubsetGeomData"]: geom_block,
             }
+            remove_hashes = set()
+            if has_morph:
+                smooth_info_block, smooth_metadata = encode_model_smooth2(subset_stats)
+                replacements[BLOCK_HASHES["ModelAnimVertInfo2"]] = b"\x00" * 40
+                replacements[BLOCK_HASHES["ModelAnimMorph2Info"]] = morph_info_block
+                replacements[BLOCK_HASHES["ModelAnimVertSmoothInfo"]] = smooth_info_block
+                if source_has_ziva:
+                    remove_hashes.add(BLOCK_HASHES["ModelAnimZiva2Info"])
+                    export_warnings.append(
+                        "Registered shape keys were exported as Morph2, so stale fixed-topology Ziva data was removed."
+                    )
+            elif source_has_morph:
+                remove_hashes.update({
+                    BLOCK_HASHES["ModelAnimMorph2Info"],
+                    BLOCK_HASHES["ModelAnimVertSmoothInfo"],
+                    BLOCK_HASHES["ModelAnimVertInfo2"],
+                })
+            elif source_has_ziva:
+                raise ValueError(
+                    "This source uses fixed-topology Ziva but the output has no Morph2 targets. "
+                    "Create/transfer at least one registered deformation target before exporting custom geometry."
+                )
             replacements.update(_build_inert_look_bvh_blocks(template))
 
             wm.progress_update(75)
-            dat1, geom_offset, geom_size = _rebuild_dat1(template, replacements, string_pool)
+            dat1, geom_offset, geom_size = _rebuild_dat1(
+                template,
+                replacements,
+                string_pool,
+                remove_hashes=remove_hashes,
+            )
             source_had_stg = bool(template.had_stg or arm.get("engine_model_source_had_stg", False))
             stg_mode = str(getattr(self, "stg_mode", "SCENE") or "SCENE")
             if stg_mode == "STG":
@@ -2089,7 +2545,7 @@ class ExportEngineModel(Operator, ExportHelper):
             elif stg_mode == "AUTO":
                 add_stg = source_had_stg
             else:
-                add_stg = bool(getattr(context.scene, "engine_export_add_stg_header", False))
+                add_stg = bool(getattr(context.scene, "engine_export_add_stg_header", True))
             if add_stg:
                 stg_header = _build_stg_header(template.version, geom_offset, geom_size)
                 out = stg_header + dat1
@@ -2112,6 +2568,8 @@ class ExportEngineModel(Operator, ExportHelper):
             self.report({'WARNING'}, _format_export_warnings(export_warnings))
         self.report(
             {'INFO'},
-            f"Wrote {format_name}: {len(mesh_objects)} LOD0 mesh(es), {sum(s['vertex_count'] for s in subset_stats)} vertices, {sum(s['index_count'] // 3 for s in subset_stats)} triangles."
+            f"Wrote {format_name}: {len(mesh_objects)} LOD0 mesh(es), {sum(s['vertex_count'] for s in subset_stats)} vertices, "
+            f"{sum(s['index_count'] // 3 for s in subset_stats)} triangles, "
+            f"{len(morph_metadata.get('targets', [])) if has_morph else 0} Morph2 target(s)."
         )
         return {'FINISHED'}
