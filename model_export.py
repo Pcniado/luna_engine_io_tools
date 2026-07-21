@@ -2,7 +2,13 @@ from .utils import *
 from .constants import SUBSET_CENTER_LOG_SCALE
 from .dat1 import DAT1_BLOCK_TABLE_ENTRY_SIZE, DAT1_FILE_ID, DAT1_FIXUP_TABLE_ENTRY_SIZE, DAT1_HEADER_SIZE
 from .hashes import BLOCK_HASHES, string_crc32
-from .model_morph import MORPH_DELTA_PRECISION, decode_model_morph2, encode_model_morph2, encode_model_smooth2
+from .model_morph import (
+    MORPH_DELTA_PRECISION,
+    MORPH_VERTEX_DELTA_EPSILON,
+    decode_model_morph2,
+    encode_model_morph2,
+    encode_model_smooth2,
+)
 from .model_import import (
     MODEL_MATERIAL_INFO_SIZE,
     MODEL_MATERIAL_SIZE,
@@ -28,6 +34,8 @@ from .model_import import (
     SUBSET_FLAG_HAS_UV1,
     SUBSET_FLAG_HAS_UV2,
     SUBSET_FLAG_SKINNED,
+    _decode_packed_normal,
+    _decode_packed_tangent,
     _parse_model_materials,
     _read_c_string,
 )
@@ -166,6 +174,64 @@ def _vec_normalize(a, fallback=(0.0, 0.0, 1.0)):
     if length <= 1e-8:
         return fallback
     return (a[0] / length, a[1] / length, a[2] / length)
+
+
+def _luna_triangle_tangent_space(positions, uvs):
+    #matches luna tangent gen
+    if len(positions) != 3 or len(uvs) != 3:
+        raise ValueError("Luna tangent generation requires one triangle")
+    epsilon = 0.000001
+    edge_01 = _vec_sub(positions[1], positions[0])
+    edge_02 = _vec_sub(positions[2], positions[0])
+    triangle_normal = _vec_normalize(_vec_cross(edge_01, edge_02), fallback=(0.0, 1.0, 0.0))
+
+    min_v, mid_v, max_v = 0, 1, 2
+    if uvs[max_v][1] < uvs[mid_v][1]:
+        max_v, mid_v = mid_v, max_v
+    if uvs[max_v][1] < uvs[min_v][1]:
+        max_v, min_v = min_v, max_v
+    if uvs[mid_v][1] < uvs[min_v][1]:
+        mid_v, min_v = min_v, mid_v
+    v_range = float(uvs[max_v][1]) - float(uvs[min_v][1])
+    interp = (
+        (float(uvs[mid_v][1]) - float(uvs[min_v][1])) / v_range
+        if v_range > epsilon else 1.0
+    )
+    interp_pos = _vec_add(
+        _vec_mul(positions[min_v], 1.0 - interp),
+        _vec_mul(positions[max_v], interp),
+    )
+    interp_u = float(uvs[min_v][0]) * (1.0 - interp) + float(uvs[max_v][0]) * interp
+    tangent = _vec_sub(interp_pos, positions[mid_v])
+    if interp_u < float(uvs[mid_v][0]):
+        tangent = _vec_mul(tangent, -1.0)
+    tangent = _vec_normalize(tangent, fallback=(1.0, 0.0, 0.0))
+
+    min_u, mid_u, max_u = 0, 1, 2
+    if uvs[max_u][0] < uvs[mid_u][0]:
+        max_u, mid_u = mid_u, max_u
+    if uvs[max_u][0] < uvs[min_u][0]:
+        max_u, min_u = min_u, max_u
+    if uvs[mid_u][0] < uvs[min_u][0]:
+        mid_u, min_u = min_u, mid_u
+    u_range = float(uvs[max_u][0]) - float(uvs[min_u][0])
+    interp = (
+        (float(uvs[mid_u][0]) - float(uvs[min_u][0])) / u_range
+        if u_range > epsilon else 1.0
+    )
+    interp_pos = _vec_add(
+        _vec_mul(positions[min_u], 1.0 - interp),
+        _vec_mul(positions[max_u], interp),
+    )
+    interp_v = float(uvs[min_u][1]) * (1.0 - interp) + float(uvs[max_u][1]) * interp
+    binormal = _vec_sub(interp_pos, positions[mid_u])
+    if interp_v < float(uvs[mid_u][1]):
+        binormal = _vec_mul(binormal, -1.0)
+    binormal = _vec_normalize(binormal, fallback=(0.0, 0.0, 1.0))
+
+    computed_binormal = _vec_cross(tangent, triangle_normal)
+    tangent_flip = 1.0 if _vec_dot(computed_binormal, binormal) > 0.0 else -1.0
+    return tangent, tangent_flip
 
 
 def _blender_to_engine_vec(value):
@@ -404,7 +470,11 @@ def _build_material_entries(mesh_objects, original_materials, export_warnings=No
             assigned_index = _clamp(fallback_index, 0, len(entries) - 1)
             assigned_indices.append(assigned_index)
             _set_object_material_index_prop(obj, assigned_index)
-            _append_export_warning(export_warnings, f"{obj.name}: no material assigned, using source material slot {fallback_index}")
+            _append_export_warning(
+                export_warnings,
+                f"{obj.name} has no Blender material. The original game material was kept. "
+                "Assign a material only if you want to replace it.",
+            )
             continue
 
         material_index_prop = mat.get("engine_material_index")
@@ -446,7 +516,12 @@ def _build_material_entries(mesh_objects, original_materials, export_warnings=No
             material_index = None
 
         if not path:
-            _append_export_warning(export_warnings, f"{obj.name}: material '{mat.name}' has no .material path, using template/fallback data")
+            _append_export_warning(
+                export_warnings,
+                f"{obj.name}'s material '{mat.name}' is not linked to a game material. The original game "
+                "settings were kept. Set Material Asset Path in the Luna Engine Material panel if you want "
+                "to replace them.",
+            )
         match_index = None
         for idx, entry in enumerate(entries):
             if path and _material_paths_match(entry.get("path", ""), path):
@@ -501,8 +576,20 @@ def _append_export_warning(warnings, message):
 def _format_export_warnings(warnings, limit=5):
     shown = list(warnings[:limit])
     if len(warnings) > limit:
-        shown.append(f"+{len(warnings) - limit} more")
-    return "; ".join(shown)
+        shown.append(
+            f"After fixing these, export again to see the remaining {len(warnings) - limit} check(s)"
+        )
+    return "Export finished. Please check: " + " | ".join(shown)
+
+
+def _friendly_export_error(exc):
+    message = str(exc or "").strip()
+    if isinstance(exc, ValueError) and message:
+        return message
+    return (
+        "Something unexpected stopped the export. Re-import the original .model file and try again. "
+        "If it keeps happening, share the .blend file and original .model file with the add-on developer."
+    )
 
 
 def _uv_name_slot(name):
@@ -595,7 +682,11 @@ def _ensure_model_uv_layers(obj, warnings=None):
         if layer is not None and layer.name != f"UV{slot}":
             old_name = layer.name
             layer.name = f"__LunaUV{slot}"
-            _append_export_warning(warnings, f"{obj.name}: renamed UV layer '{old_name}' to UV{slot}")
+            _append_export_warning(
+                warnings,
+                f"{obj.name}'s UV map '{old_name}' was renamed to 'UV{slot}' so the game can read it. "
+                "No action is needed unless you meant to use a different UV map.",
+            )
 
     for slot, info in result.items():
         layer = info["layer"]
@@ -603,11 +694,14 @@ def _ensure_model_uv_layers(obj, warnings=None):
             layer = uv_layers.new(name=f"UV{slot}")
             _zero_uv_layer(layer)
             result[slot] = {"layer": layer, "source_present": False}
-            _append_export_warning(warnings, f"{obj.name}: created missing UV{slot} layer")
         layer.name = f"UV{slot}"
 
     if not original_layers:
-        _append_export_warning(warnings, f"{obj.name}: mesh had no UV layers; created UV0-UV2 with zero values")
+        _append_export_warning(
+            warnings,
+            f"{obj.name} had no UV maps, so blank ones were added. Export can finish, but textures may "
+            "look wrong. Unwrap the mesh to UV0, then export again.",
+        )
     return result
 
 
@@ -658,8 +752,93 @@ def _uv_nearly_equal(left, right, threshold=0.0001):
     )
 
 
+def _linear_matrix_is_identity(matrix, threshold=1.0e-7):
+    for row in range(3):
+        for column in range(3):
+            expected = 1.0 if row == column else 0.0
+            if abs(float(matrix[row][column]) - expected) > threshold:
+                return False
+    return True
+
+
+def _source_model_basis(mesh, uv0_layer, basis_coords):
+    vertex_count = len(mesh.vertices)
+    attributes = {}
+    for name in (
+        "engine_source_normal_tangent",
+        "engine_position_w",
+        "engine_source_position",
+        "engine_source_uv0_u",
+        "engine_source_uv0_v",
+    ):
+        attribute = mesh.attributes.get(name)
+        if attribute is None or attribute.domain != 'POINT' or len(attribute.data) != vertex_count:
+            return None
+        attributes[name] = attribute.data
+
+    expected_signature = str(mesh.get("engine_source_topology_signature", "") or "")
+    current_signature = model_topology_signature(
+        int(mesh.loops[loop_index].vertex_index)
+        for triangle in mesh.loop_triangles
+        for loop_index in triangle.loops
+    )
+    if not expected_signature or current_signature != expected_signature:
+        return None
+
+    expected_normal_signature = str(
+        mesh.get("engine_source_corner_normal_signature", "") or ""
+    )
+    if expected_normal_signature and model_corner_normal_signature(mesh.corner_normals) != expected_normal_signature:
+        return None
+
+    source_positions = attributes["engine_source_position"]
+    for vertex_index, vertex in enumerate(mesh.vertices):
+        current = basis_coords[vertex_index] if basis_coords is not None else vertex.co
+        source = source_positions[vertex_index].vector
+        if any(abs(float(current[axis]) - float(source[axis])) > 1.0e-7 for axis in range(3)):
+            return None
+
+    source_words = attributes["engine_source_normal_tangent"]
+    source_uv0_u = attributes["engine_source_uv0_u"]
+    source_uv0_v = attributes["engine_source_uv0_v"]
+    normal_mismatch_count = 0
+    normal_mismatch_limit = max(4, int(len(mesh.loops) * 0.001))
+    for loop_index, loop in enumerate(mesh.loops):
+        vertex_index = int(loop.vertex_index)
+        current_uv = _loop_uv(uv0_layer, loop_index)
+        source_uv = (
+            float(source_uv0_u[vertex_index].value),
+            float(source_uv0_v[vertex_index].value),
+        )
+        if not _uv_nearly_equal(current_uv, source_uv, threshold=1.0e-7):
+            return None
+
+        if expected_normal_signature:
+            continue
+
+        source_normal_engine = _decode_packed_normal(int(source_words[vertex_index].value) & U32_MASK)
+        source_normal_blender = (
+            float(source_normal_engine[0]),
+            -float(source_normal_engine[2]),
+            float(source_normal_engine[1]),
+        )
+        current_normal = mesh.corner_normals[loop_index].vector
+        current_normal_tuple = (
+            float(current_normal.x),
+            float(current_normal.y),
+            float(current_normal.z),
+        )
+
+        if _vec_dot(current_normal_tuple, source_normal_blender) < 0.99999:
+            normal_mismatch_count += 1
+
+            if normal_mismatch_count > normal_mismatch_limit:
+                return None
+
+    return attributes
+
+
 def _luna_export_vertex_matches(candidate, normal, tangent, tangent_flip, uv0, uv1, uv2):
-    # ContentTriPool::VertexComparisonParams defaults from the engine builder.
     if _vec_dot(candidate["normal"], normal) < (1.0 - 0.002):
         return False
     if _vec_dot(candidate["tangent"], tangent) < (1.0 - 1.6):
@@ -702,8 +881,9 @@ def _vertex_weights(mesh_vertex, obj, group_to_joint, source_joint_count):
         if weight > 0.0:
             if source_joint_count is not None and not 0 <= joint_index < source_joint_count:
                 raise ValueError(
-                    f"{obj.name}: vertex {mesh_vertex.index} uses joint {joint_index}, "
-                    f"but the source model has {source_joint_count} joints"
+                    f"{obj.name} has a vertex weighted to a bone that is not in the original skeleton "
+                    f"(vertex {mesh_vertex.index}). Remove that weight or use a bone from the imported skeleton, "
+                    "then export again."
                 )
             weights.append((joint_index, weight))
     weights.sort(key=lambda item: item[1], reverse=True)
@@ -720,7 +900,8 @@ def _shape_key_export_data(obj, linear_matrix):
     for key in key_blocks:
         if len(key.data) != vertex_count:
             raise ValueError(
-                f"{obj.name}: shape key {key.name!r} has {len(key.data)} points, expected {vertex_count}"
+                f"Shape key {key.name!r} no longer fits {obj.name}. Delete and recreate that shape key, or "
+                "re-import the original model with Import Shape Keys enabled."
             )
 
     basis_coords = np.empty(vertex_count * 3, dtype=np.float64)
@@ -742,9 +923,6 @@ def _shape_key_export_data(obj, linear_matrix):
     )
     targets = []
     for key in key_blocks[1:]:
-        # Once a mesh has imported/transferred engine metadata, only registered
-        # targets are exportable.  This prevents unrelated corrective or helper
-        # shape keys from silently becoming game-visible Morph2 channels.
         if metadata and str(key.name) not in metadata:
             continue
         key_coords = np.empty(vertex_count * 3, dtype=np.float64)
@@ -755,7 +933,10 @@ def _shape_key_export_data(obj, linear_matrix):
         engine_deltas[:, 0] = armature_deltas[:, 0]
         engine_deltas[:, 1] = armature_deltas[:, 2]
         engine_deltas[:, 2] = -armature_deltas[:, 1]
-        affected = np.flatnonzero(np.linalg.norm(engine_deltas, axis=1) >= MORPH_DELTA_PRECISION)
+
+        affected = np.flatnonzero(
+            np.linalg.norm(engine_deltas, axis=1) >= MORPH_VERTEX_DELTA_EPSILON
+        )
         if not len(affected):
             continue
 
@@ -854,7 +1035,6 @@ def _export_mesh_vertices(
         normal_matrix = linear_matrix.inverted().transposed()
     except Exception:
         normal_matrix = linear_matrix
-    transform_handedness = -1.0 if linear_matrix.determinant() < 0.0 else 1.0
     group_to_joint = _vertex_group_joint_map(obj, arm)
     basis_coords, source_morph_targets = _shape_key_export_data(obj, linear_matrix)
     if not source_morph_targets and fallback_morph_targets:
@@ -869,14 +1049,10 @@ def _export_mesh_vertices(
         ]
 
     if not uv0_layer:
-        raise ValueError(f"{obj.name}: UV0 is required to calculate Luna tangent space")
-    uv0_name = str(uv0_layer.name)
-    try:
-        mesh.calc_tangents(uvmap=uv0_name)
-    except Exception as exc:
-        raise ValueError(f"{obj.name}: Blender could not calculate UV0 tangents: {exc}") from exc
-
-
+        raise ValueError(
+            f"{obj.name} needs a UV map called UV0. In Object Data Properties > UV Maps, create or rename "
+            "the main texture UV map to UV0, then export again."
+        )
     uv0_layer = _uv_layer_by_name_or_index(mesh, "UV0", 0)
     uv1_layer = _uv_layer_by_name_or_index(mesh, "UV1", 1)
     uv2_layer = _uv_layer_by_name_or_index(mesh, "UV2", 2)
@@ -889,48 +1065,76 @@ def _export_mesh_vertices(
     except Exception:
         source_position_w = None
 
-
-    luna_subset_normals = bool(arm and _source_path_from_armature(arm))
-    luna_vertex_normals = None
-    if luna_subset_normals:
-        normal_sums = [(0.0, 0.0, 0.0) for _ in mesh.vertices]
-        normal_counts = [0 for _ in mesh.vertices]
-        for corner_index, mesh_loop in enumerate(mesh.loops):
-            corner = mesh.corner_normals[corner_index].vector
-            vertex_index = int(mesh_loop.vertex_index)
-            normal_sums[vertex_index] = _vec_add(
-                normal_sums[vertex_index],
-                (float(corner.x), float(corner.y), float(corner.z)),
-            )
-            normal_counts[vertex_index] += 1
-        luna_vertex_normals = [
-            mathutils.Vector(_vec_normalize(normal_sums[index]))
-            if normal_counts[index] else mesh.vertices[index].normal.copy()
-            for index in range(len(mesh.vertices))
-        ]
+    source_basis = _source_model_basis(mesh, uv0_layer, basis_coords)
+    source_basis_packed_exact = bool(source_basis and _linear_matrix_is_identity(linear_matrix))
+    try:
+        tangent_flip_transform = -1.0 if float(linear_matrix.determinant()) < 0.0 else 1.0
+    except Exception:
+        tangent_flip_transform = 1.0
 
     export_vertices = []
     vertex_buckets = {}
     indices = []
 
     for triangle in mesh.loop_triangles:
+        triangle_loops = tuple(int(loop_index) for loop_index in triangle.loops)
+        triangle_positions = []
+        triangle_uv0s = []
+        for loop_index in triangle_loops:
+            source_vertex_index = int(mesh.loops[loop_index].vertex_index)
+            source_co = (
+                mathutils.Vector(basis_coords[source_vertex_index])
+                if basis_coords is not None else mesh.vertices[source_vertex_index].co
+            )
+            triangle_positions.append(_blender_to_engine_vec(matrix @ source_co))
+            triangle_uv0s.append(_loop_uv(uv0_layer, loop_index))
+        triangle_tangent, triangle_tangent_flip = _luna_triangle_tangent_space(
+            triangle_positions,
+            triangle_uv0s,
+        )
         tri_indices = []
-        for loop_index in triangle.loops:
+        for triangle_corner, loop_index in enumerate(triangle_loops):
             loop = mesh.loops[loop_index]
             source_vertex_index = int(loop.vertex_index)
             uv0 = _loop_uv(uv0_layer, loop_index)
             uv1 = _loop_uv(uv1_layer, loop_index) if has_uv1 and uv1_layer else None
             uv2 = _loop_uv(uv2_layer, loop_index) if has_uv2 and uv2_layer else None
-            corner_normal = (
-                luna_vertex_normals[source_vertex_index]
-                if luna_subset_normals
-                else mesh.corner_normals[loop_index].vector
-            )
-            loop_tangent = loop.tangent
+            # Preserve Blender's split/corner normals. Averaging these by
+            # control point rounds deliberately sharp eye and lens frames.
+            corner_normal = mesh.corner_normals[loop_index].vector
             normal = _vec_normalize(_blender_to_engine_vec(normal_matrix @ corner_normal))
-            tangent = _vec_normalize(_blender_to_engine_vec(linear_matrix @ loop_tangent), fallback=(1.0, 0.0, 0.0))
-            tangent = _vec_normalize(_vec_sub(tangent, _vec_mul(normal, _vec_dot(normal, tangent))), fallback=(1.0, 0.0, 0.0))
-            tangent_flip = float(loop.bitangent_sign) * transform_handedness
+            packed_source_basis = None
+            if source_basis is not None:
+                source_word = int(
+                    source_basis["engine_source_normal_tangent"][source_vertex_index].value
+                ) & U32_MASK
+                source_w = int(source_basis["engine_position_w"][source_vertex_index].value)
+                source_normal_engine = _decode_packed_normal(source_word)
+                source_normal_blender = mathutils.Vector((
+                    float(source_normal_engine[0]),
+                    -float(source_normal_engine[2]),
+                    float(source_normal_engine[1]),
+                ))
+                normal = _vec_normalize(
+                    _blender_to_engine_vec(normal_matrix @ source_normal_blender),
+                    fallback=normal,
+                )
+                source_tangent_engine = _decode_packed_tangent(source_word, source_w)
+                source_tangent_blender = mathutils.Vector((
+                    float(source_tangent_engine[0]),
+                    -float(source_tangent_engine[2]),
+                    float(source_tangent_engine[1]),
+                ))
+                tangent = _vec_normalize(
+                    _blender_to_engine_vec(linear_matrix @ source_tangent_blender),
+                    fallback=triangle_tangent,
+                )
+                tangent_flip = (1.0 if source_w >= 0 else -1.0) * tangent_flip_transform
+                if source_basis_packed_exact:
+                    packed_source_basis = (source_word, source_w)
+            else:
+                tangent = triangle_tangent
+                tangent_flip = triangle_tangent_flip
             extrusion_encoded = 16
             if source_position_w is not None:
                 extrusion_encoded = (abs(int(source_position_w[source_vertex_index].value)) >> 10) & 0x1F
@@ -945,16 +1149,11 @@ def _export_mesh_vertices(
                     break
             if export_index is None:
                 vertex = mesh.vertices[source_vertex_index]
-                source_co = (
-                    mathutils.Vector(basis_coords[source_vertex_index])
-                    if basis_coords is not None else vertex.co
-                )
-                co = matrix @ source_co
                 export_index = len(export_vertices)
                 vertex_buckets.setdefault(source_vertex_index, []).append(export_index)
                 export_vertices.append({
                     "source_index": source_vertex_index,
-                    "co": _blender_to_engine_vec(co),
+                    "co": triangle_positions[triangle_corner],
                     "normal": normal,
                     "tangent": tangent,
                     "tangent_flip": tangent_flip,
@@ -962,6 +1161,7 @@ def _export_mesh_vertices(
                     "_normal_sum": normal,
                     "_tangent_sum": tangent,
                     "_basis_count": 1,
+                    "_packed_source_basis": packed_source_basis,
                     "uv0": uv0,
                     "uv1": uv1,
                     "uv2": uv2,
@@ -974,20 +1174,23 @@ def _export_mesh_vertices(
     for vertex in export_vertices:
         normal = _vec_normalize(vertex.pop("_normal_sum"))
         tangent = _vec_normalize(vertex.pop("_tangent_sum"), fallback=(1.0, 0.0, 0.0))
-        tangent = _vec_normalize(
-            _vec_sub(tangent, _vec_mul(normal, _vec_dot(normal, tangent))),
-            fallback=(1.0, 0.0, 0.0),
-        )
         vertex.pop("_basis_count", None)
-        normal_tangent, tangent_y = _pack_normal_tangent(normal, tangent)
         vertex["normal"] = normal
         vertex["tangent"] = tangent
-        vertex["normal_tangent"] = normal_tangent
-        vertex["position_w"] = _pack_position_w(
-            tangent_y,
-            vertex.pop("tangent_flip"),
-            vertex.pop("extrusion_encoded"),
-        )
+        packed_source_basis = vertex.pop("_packed_source_basis", None)
+        tangent_flip = vertex.pop("tangent_flip")
+        extrusion_encoded = vertex.pop("extrusion_encoded")
+        if packed_source_basis is not None:
+            vertex["normal_tangent"] = int(packed_source_basis[0]) & U32_MASK
+            vertex["position_w"] = int(packed_source_basis[1])
+        else:
+            normal_tangent, tangent_y = _pack_normal_tangent(normal, tangent)
+            vertex["normal_tangent"] = normal_tangent
+            vertex["position_w"] = _pack_position_w(
+                tangent_y,
+                tangent_flip,
+                extrusion_encoded,
+            )
 
     export_vertices, indices = _order_export_vertices_by_control_point(
         export_vertices,
@@ -1049,7 +1252,10 @@ def _split_export_vertex_chunks(vertices, indices, max_vertices=MODEL_SPLIT_VERT
             chunk_indices.append(mapped)
 
         if len(chunk_vertices) > max_vertices:
-            raise ValueError("single triangle exceeded the per-subset vertex limit")
+            raise ValueError(
+                "One face is too large for the game format. Apply the mesh modifiers, triangulate the mesh, "
+                "and split very large geometry into smaller objects before exporting again."
+            )
 
     flush_chunk()
     return chunks
@@ -1185,7 +1391,10 @@ def _prepare_cluster_skin(normalized_weights):
         joint_min = 0
     joint_offset = min((joint_min // SKIN_JOINT_OFFSET_STEP) * SKIN_JOINT_OFFSET_STEP, SKIN_JOINT_OFFSET_MAX)
     if joint_count_max == 0 or joint_count_max > 12:
-        raise ValueError("skin cluster influence count is out of range")
+        raise ValueError(
+            "Some vertices use more than 12 bone weights. In Weight Paint mode, limit each vertex to 12 "
+            "bones or fewer, normalize the weights, then export again."
+        )
 
     prepared = []
     is_16bit = False
@@ -1267,7 +1476,10 @@ def _build_skin_sections(vertices, force_skin, anim_cluster_count=0):
         _align_buffer(skin_data, SKIN_CLUSTER_WORD_BYTES)
         data_offset4 = len(skin_data) // SKIN_CLUSTER_WORD_BYTES
         if data_offset4 > SKIN_CLUSTER_OFFSET_MASK:
-            raise ValueError("skin stream is too large for ModelSubset cluster offsets")
+            raise ValueError(
+                "This weighted mesh is too large for one game mesh part. Split it into smaller objects, keep "
+                "their Armature parent and weights, then export again."
+            )
         header = data_offset4 | ((joint_count_max - 1) << SKIN_CLUSTER_INFLUENCE_SHIFT)
         if is_16bit:
             header |= SKIN_CLUSTER_FULL_INDEX_BIT
@@ -1289,6 +1501,61 @@ def _triangle_uv_area(a, b, c):
         (b[0] - a[0]) * (c[1] - a[1])
         - (b[1] - a[1]) * (c[0] - a[0])
     ) * 0.5
+
+
+def _repair_missing_skin_weights(vertices, indices):
+    missing = {index for index, vertex in enumerate(vertices) if not vertex.get("weights")}
+    if not missing:
+        return 0, 0
+
+    source_vertices = {
+        int(vertices[index].get("source_index", index))
+        for index in missing
+    }
+    adjacency = [set() for _vertex in vertices]
+    for index in range(0, len(indices) - 2, 3):
+        a, b, c = (int(indices[index]), int(indices[index + 1]), int(indices[index + 2]))
+        adjacency[a].update((b, c))
+        adjacency[b].update((a, c))
+        adjacency[c].update((a, b))
+
+    while missing:
+        updates = {}
+        for vertex_index in missing:
+            neighbor_weights = [
+                vertices[neighbor].get("weights", [])
+                for neighbor in adjacency[vertex_index]
+                if vertices[neighbor].get("weights")
+            ]
+            if not neighbor_weights:
+                continue
+            totals = {}
+            for weights in neighbor_weights:
+                for joint, weight in weights:
+                    totals[int(joint)] = totals.get(int(joint), 0.0) + float(weight)
+            divisor = float(len(neighbor_weights))
+            updates[vertex_index] = sorted(
+                ((joint, weight / divisor) for joint, weight in totals.items() if weight > 0.0),
+                key=lambda item: item[1],
+                reverse=True,
+            )[:12]
+        if not updates:
+            break
+        for vertex_index, weights in updates.items():
+            vertices[vertex_index]["weights"] = weights
+        missing.difference_update(updates)
+
+    fallback_count = len(missing)
+    if missing:
+        joint_totals = {}
+        for vertex in vertices:
+            for joint, weight in vertex.get("weights", []):
+                joint_totals[int(joint)] = joint_totals.get(int(joint), 0.0) + float(weight)
+        fallback_joint = max(joint_totals, key=joint_totals.get) if joint_totals else 0
+        for vertex_index in missing:
+            vertices[vertex_index]["weights"] = [(fallback_joint, 1.0)]
+
+    return len(source_vertices), fallback_count
 
 
 def _fit_subset_mpu(vertices, requested_mpu):
@@ -1365,14 +1632,20 @@ def _build_subset_geometry_from_data(
     has_uv1,
     has_uv2,
     anim_vert_count=0,
+    export_warnings=None,
 ):
     original_flags = 0
     if original_record:
         original_flags = struct.unpack_from("<H", original_record, MODEL_SUBSET_FLAGS_OFFSET)[0]
     if len(vertices) > MODEL_MAX_VERTEX_COUNT:
-        raise ValueError(f"{obj.name}: {len(vertices)} vertices exceeds the per-subset 65535 vertex limit")
+        raise ValueError(
+            f"{obj.name} is too large for one game mesh part. Split it into smaller meshes with fewer than "
+            f"{MODEL_MAX_VERTEX_COUNT} export vertices each, then try again."
+        )
     if any(index >= MODEL_MAX_VERTEX_COUNT for index in indices):
-        raise ValueError(f"{obj.name}: triangle index exceeds the 16-bit engine index limit")
+        raise ValueError(
+            f"{obj.name} is too large for one game mesh part. Split it into smaller meshes, then try again."
+        )
 
     mpu = float(obj.get("engine_mpu", arm.get("engine_mpu", MODEL_DEFAULT_MPU) if arm else MODEL_DEFAULT_MPU) or MODEL_DEFAULT_MPU)
     if mpu <= 0.0:
@@ -1427,18 +1700,22 @@ def _build_subset_geometry_from_data(
 
     force_skin = bool(original_flags & SUBSET_FLAG_SKINNED) or any(vertex.get("weights") for vertex in vertices)
     if force_skin:
-        missing_weights = [vertex["source_index"] for vertex in vertices if not vertex.get("weights")]
-        if missing_weights:
-            sample = ", ".join(str(index) for index in missing_weights[:8])
-            suffix = "..." if len(missing_weights) > 8 else ""
-            raise ValueError(
-                f"{obj.name}: {len(missing_weights)} skinned export vertices have no valid bone weights "
-                f"(source vertex indices: {sample}{suffix}). Assign weights before export; Luna cannot "
-                "safely bind missing weights to joint 0."
+        repaired_count, fallback_count = _repair_missing_skin_weights(vertices, indices)
+        if repaired_count:
+            detail = (
+                f"; {fallback_count} disconnected export vertices used the object's dominant bone"
+                if fallback_count else ""
+            )
+            _append_export_warning(
+                export_warnings,
+                f"{obj.name}: automatically repaired missing bone weights on {repaired_count} vertices{detail}.",
             )
     anim_vert_count = int(anim_vert_count)
     if not 0 <= anim_vert_count <= len(vertices):
-        raise ValueError(f"{obj.name}: invalid AnimVert count {anim_vert_count}")
+        raise ValueError(
+            f"{obj.name}'s saved facial-animation setup no longer matches the mesh. Re-import the original "
+            "model with Import Shape Keys enabled, then repeat your edits."
+        )
     anim_cluster_count = _align(anim_vert_count, SKIN_CLUSTER_VERTEX_COUNT) // SKIN_CLUSTER_VERTEX_COUNT
     skin_data, cluster_headers = _build_skin_sections(vertices, force_skin, anim_cluster_count)
     vertex_skin_offset = 0
@@ -1556,12 +1833,13 @@ def _build_subset_geometry_chunks(
         fallback_morph_targets=fallback_morph_targets,
     )
     if not vertices or not indices:
-        raise ValueError(f"{obj.name}: mesh has no triangles to export")
+        raise ValueError(
+            f"{obj.name} has no faces that can be exported. Add or triangulate faces, then export again."
+        )
     if len(vertices) > MODEL_MAX_VERTEX_COUNT or any(index >= MODEL_MAX_VERTEX_COUNT for index in indices):
         raise ValueError(
-            f"{obj.name}: {len(vertices)} export vertices exceeds the engine per-subset limit of "
-            f"{MODEL_MAX_VERTEX_COUNT}. Please split this mesh into smaller submeshes before export. "
-            "Automatic bigger-submesh splitting may be added later."
+            f"{obj.name} is too large for one game mesh part ({len(vertices)} export vertices). Split it into "
+            f"smaller meshes with fewer than {MODEL_MAX_VERTEX_COUNT} export vertices each, then try again."
         )
     return [(vertices, indices, has_uv1, has_uv2, morph_targets, anim_vert_count)]
 
@@ -1620,6 +1898,7 @@ def _build_geometry_and_subset_blocks(
                 has_uv1,
                 has_uv2,
                 anim_vert_count=anim_vert_count,
+                export_warnings=export_warnings,
             )
             record = bytearray(record)
             struct.pack_into("<I", record, MODEL_SUBSET_BASE_OFFSET, geom_base)
@@ -1642,9 +1921,15 @@ def _build_geometry_and_subset_blocks(
                     }
                     morph_targets_by_name[name] = existing
                 elif int(existing["hash"]) != (int(target["hash"]) & U32_MASK):
-                    raise ValueError(f"Morph target {name!r} has inconsistent stored hashes across meshes")
+                    raise ValueError(
+                        f"Facial shape {name!r} is registered differently on separate meshes. Remove and "
+                        "register that shape again with the same name on every mesh, then export again."
+                    )
                 elif int(existing.get("source_index", -1)) != int(target.get("source_index", -1)):
-                    raise ValueError(f"Morph target {name!r} has inconsistent source indices across meshes")
+                    raise ValueError(
+                        f"Facial shape {name!r} comes from different source slots on separate meshes. Re-import "
+                        "with Import Shape Keys enabled and register matching shapes, then export again."
+                    )
                 existing["subsets"].append({
                     "subset_index": generated_subset_index,
                     "deltas": target["deltas"],
@@ -1737,7 +2022,7 @@ def _build_look_blocks(subset_count, string_pool, template, arm=None, subset_ind
     original_subset_block = template.payload(BLOCK_HASHES["ModelSubset"]) if BLOCK_HASHES["ModelSubset"] in template.blocks else b""
     source_subset_count = len(original_subset_block) // MODEL_SUBSET_RECORD_SIZE
     source_look_count = max(1, len(original_look) // MODEL_LOOK_SIZE)
-    source_built_look_count = len(original_look_built) // MODEL_LOOK_BUILT_SIZE
+    source_built_look_count = min(source_look_count, len(original_look_built) // MODEL_LOOK_BUILT_SIZE)
     subset_index_map = subset_index_map or {}
     use_custom_looks = bool(arm and arm.get("engine_model_looks_modified", False))
     custom_looks = _json_list_from_idprop(arm, "engine_model_looks_json") if use_custom_looks else []
@@ -1870,8 +2155,6 @@ def _build_look_blocks(subset_count, string_pool, template, arm=None, subset_ind
 
         for section in range(1, 7):
             chunk, count = source_look_section(source_index, section)
-            if (not chunk or (section == 5 and count == 0)) and source_index != 0:
-                chunk, count = source_look_section(0, section)
             section_offsets.append(headers_size + len(look_built_data))
             if section < 6:
                 section_counts.append(count)
@@ -2058,7 +2341,7 @@ def _combine_model_bounds(source_bounds, subset_stats):
     return center, tuple(value + radius_padding for value in extents), radius + radius_padding
 
 
-def _build_model_built_block(template, subset_stats, arm=None, has_morph=False):
+def _build_model_built_block(template, subset_stats, arm=None, has_morph=False, has_smooth=False):
     block_hash = BLOCK_HASHES["ModelBuilt"]
     original = bytearray(template.payload(block_hash) if block_hash in template.blocks else b"\x00" * MODEL_BUILT_SIZE)
     if len(original) < MODEL_BUILT_SIZE:
@@ -2081,7 +2364,9 @@ def _build_model_built_block(template, subset_stats, arm=None, has_morph=False):
         | CONTENT_FLAG_USES_AUTO_LODS
     )
     if has_morph:
-        content_flags |= CONTENT_FLAG_ANIM_MORPH | CONTENT_FLAG_ANIM_VERT_SMOOTH
+        content_flags |= CONTENT_FLAG_ANIM_MORPH
+    if has_smooth:
+        content_flags |= CONTENT_FLAG_ANIM_VERT_SMOOTH
     struct.pack_into("<H", model_built, MODEL_BUILT_CONTENT_FLAGS_OFFSET, content_flags)
 
     source_bounds, source_common_mpu, source_vertex_mpu = _source_model_built_state(model_built, arm=arm)
@@ -2124,7 +2409,6 @@ def _build_model_built_block(template, subset_stats, arm=None, has_morph=False):
 
 
 def _source_morph_targets_for_older_scene(template, mesh_objects):
-    """Recover source Morph2 deltas when an older .blend has no imported keys."""
     decoded = decode_model_morph2(template.data, template.blocks)
     if not decoded:
         return {}, 0
@@ -2151,8 +2435,8 @@ def _source_morph_targets_for_older_scene(template, mesh_objects):
                 continue
             if len(objects) != 1 or not 0 <= subset_index < source_subset_count:
                 raise ValueError(
-                    f"Cannot preserve source Morph2 target {target['name']!r}: subset {subset_index} "
-                    "does not map to exactly one imported mesh"
+                    f"The saved facial shape {target['name']!r} cannot be matched to one mesh part. "
+                    "Re-import the original model with Import Shape Keys enabled, then repeat your edits."
                 )
             obj = objects[0]
             mesh = obj.data
@@ -2161,9 +2445,9 @@ def _source_morph_targets_for_older_scene(template, mesh_objects):
             source_vertex_count = struct.unpack_from("<I", source_subset, record_offset + MODEL_SUBSET_VERTEX_COUNT_OFFSET)[0]
             if len(mesh.vertices) != source_vertex_count:
                 raise ValueError(
-                    f"Cannot preserve source Morph2 target {target['name']!r}: {obj.name} has "
-                    f"{len(mesh.vertices)} control vertices, source subset {subset_index} has {source_vertex_count}. "
-                    "Re-import with Import Shape Keys enabled after topology changes."
+                    f"{obj.name}'s vertex count changed, so the saved facial shape {target['name']!r} no "
+                    "longer fits. Re-import the original model with Import Shape Keys enabled before changing "
+                    "the mesh topology."
                 )
             subset_base = struct.unpack_from("<I", source_subset, record_offset + MODEL_SUBSET_BASE_OFFSET)[0]
             index_offset = struct.unpack_from("<I", source_subset, record_offset + MODEL_SUBSET_INDEX_DATA_OFFSET)[0]
@@ -2184,12 +2468,15 @@ def _source_morph_targets_for_older_scene(template, mesh_objects):
             )
             if current_triangles != source_triangles:
                 raise ValueError(
-                    f"Cannot preserve source Morph2 target {target['name']!r}: {obj.name} topology no longer "
-                    "matches its source subset. Re-import with Import Shape Keys enabled, or remove Morph2 deliberately."
+                    f"{obj.name}'s faces changed, so the saved facial shape {target['name']!r} no longer fits. "
+                    "Re-import the original model with Import Shape Keys enabled before changing the mesh faces."
                 )
             deltas = {int(index): tuple(value) for index, value in target_subset.get("deltas", {}).items()}
             if any(index < 0 or index >= source_vertex_count for index in deltas):
-                raise ValueError(f"Source Morph2 target {target['name']!r} contains an invalid vertex index")
+                raise ValueError(
+                    f"The original file has damaged facial-shape data for {target['name']!r}. "
+                    "Try a fresh copy of the original extracted .model file."
+                )
             result.setdefault(subset_index, []).append({
                 "name": str(target["name"]),
                 "hash": int(target["hash"]) & U32_MASK,
@@ -2198,8 +2485,8 @@ def _source_morph_targets_for_older_scene(template, mesh_objects):
             })
     if not result:
         raise ValueError(
-            "The source contains Morph2 targets, but none map to the meshes in this older scene. "
-            "Re-import with Import Shape Keys enabled."
+            "The facial shapes from this older Blender file cannot be matched to the loaded meshes. "
+            "Re-import the original model with Import Shape Keys enabled."
         )
     return result, skipped_records
 
@@ -2227,7 +2514,6 @@ def _block_alignment(block_hash):
 
 
 def _relocate_model_string_offsets(block_hash, payload, delta):
-    """Relocate absolute DAT1 string pointers in serialized model blocks."""
     if not delta or not payload:
         return payload
     data = bytearray(payload)
@@ -2240,8 +2526,7 @@ def _relocate_model_string_offsets(block_hash, payload, delta):
                 if value:
                     struct.pack_into("<I", data, base + field_offset, value + delta)
     elif block_hash == BLOCK_HASHES["ModelLookBuilt"]:
-        # Headers occupy the leading fixed-size record array; data sections
-        # follow. Infer the count from the first section offset.
+        # Headers occupy the leading fixed-size record array
         look_count = 0
         if len(data) >= MODEL_LOOK_BUILT_SIZE:
             first_section = struct.unpack_from("<Q", data, 0)[0]
@@ -2265,7 +2550,10 @@ def _relocate_model_string_offsets(block_hash, payload, delta):
 
 def _rebuild_dat1(template, replacements, string_pool, remove_hashes=None):
     if template.fixup_count != 0:
-        raise ValueError("model export currently supports DAT1 files with zero fixups only")
+        raise ValueError(
+            "This particular game-model layout is not supported yet. Try a different original .model file. "
+            "If you need this exact model, share the System Console error with the add-on developer."
+        )
 
     remove_hashes = set(remove_hashes or ())
     physical_hashes = [
@@ -2334,7 +2622,10 @@ def _rebuild_dat1(template, replacements, string_pool, remove_hashes=None):
 def _asset_chunk_info(size):
     size = int(size)
     if size < 0 or size > ASSET_CHUNK_UNCOMPRESSED_MASK:
-        raise ValueError("STG chunk size exceeds the serialized asset header limit")
+        raise ValueError(
+            "The exported model is too large for one game file. Split large meshes into smaller objects, "
+            "then export again."
+        )
     return (
         size
         | (size << ASSET_CHUNK_COMPRESSED_SHIFT)
@@ -2353,6 +2644,95 @@ def _build_stg_header(version, topology_size, bulk_size):
     stg += serialized_header
     _align_buffer(stg, STG_HEADER_ALIGN)
     return bytes(stg)
+
+
+def _expected_original_model_name(arm):
+    source_name = os.path.basename(_source_path_from_armature(arm))
+    if source_name:
+        return source_name
+
+    arm_name = str(getattr(arm, "name", "") or "skeleton")
+    model_name = re.match(r"^(.*\.model)(?:\.\d{3})?$", arm_name, flags=re.IGNORECASE)
+    if model_name:
+        return model_name.group(1)
+    return f"{arm_name}.model"
+
+
+class MODEL_OT_select_original_model_for_export(Operator, ImportHelper):
+    bl_idname = "model.select_original_model_for_export"
+    bl_label = "Please Select Original .model"
+    bl_description = "Select the original skeleton model to use as the injection template"
+    filename_ext = ".model"
+    filter_glob: StringProperty(default="*.model;*.dat1", options={'HIDDEN'})
+    stg_mode: StringProperty(default="SCENE", options={'HIDDEN', 'SKIP_SAVE'})
+    expected_model_name: StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
+
+    def draw(self, context):
+        expected_name = str(self.expected_model_name or "skeleton.model")
+        self.layout.label(text=f"Please select original {expected_name}", icon='ARMATURE_DATA')
+
+    def invoke(self, context, event):
+        arm = _resolve_model_armature(context)
+        if not arm:
+            self.report(
+                {'ERROR'},
+                "Select the model skeleton (Armature) or one of its meshes, then click Export again.",
+            )
+            return {'CANCELLED'}
+
+        expected_name = str(self.expected_model_name or _expected_original_model_name(arm))
+        self.expected_model_name = expected_name
+        missing_path = _source_path_from_armature(arm)
+        if missing_path:
+            self.filepath = missing_path
+        elif not self.filepath:
+            self.filepath = expected_name
+        self.report(
+            {'INFO'},
+            f"Please select original {expected_name}.",
+        )
+        return ImportHelper.invoke(self, context, event)
+
+    def execute(self, context):
+        arm = _resolve_model_armature(context)
+        if not arm:
+            self.report({'ERROR'}, "The selected model skeleton is no longer available.")
+            return {'CANCELLED'}
+
+        source_path = os.path.abspath(self.filepath)
+        if not os.path.isfile(source_path):
+            self.report({'ERROR'}, "Please select an existing original skeleton .model file.")
+            return {'CANCELLED'}
+
+        try:
+            template = _Dat1Template(source_path)
+        except Exception:
+            log_exception("Could not read replacement source model template %s", source_path)
+            self.report(
+                {'ERROR'},
+                "That file is not a readable original game .model. Please select another skeleton model.",
+            )
+            return {'CANCELLED'}
+
+        arm["engine_model_source_path"] = source_path
+        arm["engine_model_source_had_stg"] = bool(template.had_stg)
+        source_has_morphs = BLOCK_HASHES["ModelAnimMorph2Info"] in template.blocks
+        source_has_ziva = BLOCK_HASHES["ModelAnimZiva2Info"] in template.blocks
+        arm["engine_model_source_has_morphs"] = source_has_morphs
+        arm["engine_model_source_has_ziva"] = source_has_ziva
+        if source_has_morphs:
+            try:
+                source_morph = decode_model_morph2(template.data, template.blocks)
+                arm["engine_model_morph_target_count"] = int(
+                    len((source_morph or {}).get("targets", []))
+                )
+            except Exception:
+                log_exception("Could not count source model shape keys %s", source_path)
+        self.report({'INFO'}, f"Using {os.path.basename(source_path)} as the injection model.")
+        return bpy.ops.export_scene.engine_model(
+            'INVOKE_DEFAULT',
+            stg_mode=str(self.stg_mode or "SCENE"),
+        )
 
 
 class ExportEngineModel(Operator, ExportHelper):
@@ -2377,25 +2757,58 @@ class ExportEngineModel(Operator, ExportHelper):
     def draw(self, context):
         return
 
-    def execute(self, context):
+    def invoke(self, context, event):
         arm = _resolve_model_armature(context)
         if not arm:
-            self.report({'ERROR'}, "Select an imported model armature or one of its mesh children before exporting.")
+            self.report(
+                {'ERROR'},
+                "Nothing from an imported model is selected. Select the model skeleton (Armature) or one of "
+                "its meshes, then click Export again.",
+            )
             return {'CANCELLED'}
 
         source_path = _source_path_from_armature(arm)
         if not source_path or not os.path.isfile(source_path):
-            self.report({'ERROR'}, "Imported source .model path is missing. Re-import the model, then export.")
+            return bpy.ops.model.select_original_model_for_export(
+                'INVOKE_DEFAULT',
+                stg_mode=str(self.stg_mode or "SCENE"),
+                expected_model_name=_expected_original_model_name(arm),
+            )
+        return ExportHelper.invoke(self, context, event)
+
+    def execute(self, context):
+        arm = _resolve_model_armature(context)
+        if not arm:
+            self.report(
+                {'ERROR'},
+                "Nothing from an imported model is selected. Select the model skeleton (Armature) or one of "
+                "its meshes, then click Export again.",
+            )
+            return {'CANCELLED'}
+
+        source_path = _source_path_from_armature(arm)
+        if not source_path or not os.path.isfile(source_path):
+            self.report(
+                {'ERROR'},
+                "I can't find the original .model file used by this Blender scene. Import the original model "
+                "again, then export.",
+            )
             return {'CANCELLED'}
 
         try:
             template = _Dat1Template(source_path)
         except Exception as exc:
-            self.report({'ERROR'}, f"Could not read source model template: {exc}")
+            log_exception("Could not read source model template %s", source_path)
+            self.report(
+                {'ERROR'},
+                "I couldn't open the original .model file. Make sure it still exists and is an original "
+                "extracted game model, then import it again.",
+            )
             return {'CANCELLED'}
 
         source_has_morph = BLOCK_HASHES["ModelAnimMorph2Info"] in template.blocks
         source_has_ziva = BLOCK_HASHES["ModelAnimZiva2Info"] in template.blocks
+        source_has_smooth = BLOCK_HASHES["ModelAnimVertSmoothInfo"] in template.blocks
         discard_unimported_morphs = bool(getattr(arm, "engine_model_discard_unimported_morphs", False))
         recover_source_morph = (
             source_has_morph
@@ -2406,7 +2819,11 @@ class ExportEngineModel(Operator, ExportHelper):
         required = ("ModelBuilt", "ModelMaterial", "ModelLook", "ModelLookGroup", "ModelLookBuilt", "ModelSubset", "ModelSubsetGeomData")
         missing = [name for name in required if BLOCK_HASHES[name] not in template.blocks]
         if missing:
-            self.report({'ERROR'}, f"Source model is missing required block(s): {', '.join(missing)}")
+            self.report(
+                {'ERROR'},
+                "The chosen source file is not a complete game model. Import a different original .model "
+                f"file and try again. Missing internal data: {', '.join(missing)}.",
+            )
             return {'CANCELLED'}
 
         mesh_objects = [
@@ -2423,7 +2840,11 @@ class ExportEngineModel(Operator, ExportHelper):
 
         mesh_objects.sort(key=subset_sort_key)
         if not mesh_objects:
-            self.report({'ERROR'}, "No mesh children found under the selected model armature.")
+            self.report(
+                {'ERROR'},
+                "No model meshes were found under the selected skeleton. Parent at least one mesh directly "
+                "to the Armature, then export again.",
+            )
             return {'CANCELLED'}
 
         wm = context.window_manager
@@ -2451,22 +2872,22 @@ class ExportEngineModel(Operator, ExportHelper):
                     )
                 except ValueError as exc:
                     raise ValueError(
-                        f"{exc} To export this changed topology without facial morphs, enable "
-                        "Model > Export > Discard Unimported Morph2."
+                        f"{exc} If you do not need facial animation, turn on 'Discard Unimported Morph2' "
+                        "under Model > Export and try again."
                     ) from exc
-                export_warnings.append(
-                    "This older scene had no imported shape keys, so compatible source Morph2 targets were "
-                    "recovered and rebuilt automatically."
+                log_debug(
+                    "Older scene had no imported shape keys; compatible source facial shapes were recovered."
                 )
                 if skipped_morph_subset_records:
                     export_warnings.append(
-                        f"Skipped {skipped_morph_subset_records} source Morph2 subset record(s) for meshes not "
-                        "present in this import mode."
+                        f"{skipped_morph_subset_records} facial-shape part(s) could not be matched because their "
+                        "meshes are not loaded. Re-import with Import All LODs and Import Shape Keys enabled if "
+                        "you need those parts."
                     )
             elif source_has_morph and discard_unimported_morphs:
                 export_warnings.append(
-                    "Discard Unimported Morph2 was enabled: source Morph2, Smooth, and AnimVert Info blocks "
-                    "were deliberately removed because this scene has no imported shape keys."
+                    "Facial animation was left out because 'Discard Unimported Morph2' is turned on. Turn it "
+                    "off and re-import with Import Shape Keys enabled if you want facial animation."
                 )
 
             subset_block, geom_block, subset_stats, subset_index_map, morph_targets = _build_geometry_and_subset_blocks(
@@ -2494,7 +2915,15 @@ class ExportEngineModel(Operator, ExportHelper):
                 arm=arm,
                 subset_index_map=subset_index_map,
             )
-            model_built_block = _build_model_built_block(template, subset_stats, arm=arm, has_morph=has_morph)
+# i dont think this works
+            has_smooth = bool(has_morph and source_has_smooth and not source_has_ziva)
+            model_built_block = _build_model_built_block(
+                template,
+                subset_stats,
+                arm=arm,
+                has_morph=has_morph,
+                has_smooth=has_smooth,
+            )
 
             replacements = {
                 BLOCK_HASHES["ModelBuilt"]: model_built_block,
@@ -2507,14 +2936,17 @@ class ExportEngineModel(Operator, ExportHelper):
             }
             remove_hashes = set()
             if has_morph:
-                smooth_info_block, smooth_metadata = encode_model_smooth2(subset_stats)
                 replacements[BLOCK_HASHES["ModelAnimVertInfo2"]] = b"\x00" * 40
                 replacements[BLOCK_HASHES["ModelAnimMorph2Info"]] = morph_info_block
-                replacements[BLOCK_HASHES["ModelAnimVertSmoothInfo"]] = smooth_info_block
+                if has_smooth:
+                    smooth_info_block, smooth_metadata = encode_model_smooth2(subset_stats)
+                    replacements[BLOCK_HASHES["ModelAnimVertSmoothInfo"]] = smooth_info_block
+                else:
+                    remove_hashes.add(BLOCK_HASHES["ModelAnimVertSmoothInfo"])
                 if source_has_ziva:
                     remove_hashes.add(BLOCK_HASHES["ModelAnimZiva2Info"])
-                    export_warnings.append(
-                        "Registered shape keys were exported as Morph2, so stale fixed-topology Ziva data was removed."
+                    log_debug(
+                        "Converted registered shape keys from Ziva to Morph2 while preserving source shading."
                     )
             elif source_has_morph:
                 remove_hashes.update({
@@ -2523,10 +2955,11 @@ class ExportEngineModel(Operator, ExportHelper):
                     BLOCK_HASHES["ModelAnimVertInfo2"],
                 })
             elif source_has_ziva:
-                raise ValueError(
-                    "This source uses fixed-topology Ziva but the output has no Morph2 targets. "
-                    "Create/transfer at least one registered deformation target before exporting custom geometry."
-                )
+                remove_hashes.update({
+                    BLOCK_HASHES["ModelAnimZiva2Info"],
+                    BLOCK_HASHES["ModelAnimVertSmoothInfo"],
+                    BLOCK_HASHES["ModelAnimVertInfo2"],
+                })
             replacements.update(_build_inert_look_bvh_blocks(template))
 
             wm.progress_update(75)
@@ -2559,17 +2992,20 @@ class ExportEngineModel(Operator, ExportHelper):
         except Exception as exc:
             log_exception("Model export failed")
             wm.progress_end()
-            self.report({'ERROR'}, f"Model export failed: {exc}")
+            self.report({'ERROR'}, f"Export couldn't finish. {_friendly_export_error(exc)}")
             return {'CANCELLED'}
 
         wm.progress_update(100)
         wm.progress_end()
         if export_warnings:
+            for warning in export_warnings:
+                log_warning("Model export check: %s", warning)
             self.report({'WARNING'}, _format_export_warnings(export_warnings))
         self.report(
             {'INFO'},
-            f"Wrote {format_name}: {len(mesh_objects)} LOD0 mesh(es), {sum(s['vertex_count'] for s in subset_stats)} vertices, "
-            f"{sum(s['index_count'] // 3 for s in subset_stats)} triangles, "
-            f"{len(morph_metadata.get('targets', [])) if has_morph else 0} Morph2 target(s)."
+            f"Export finished ({format_name}): {len(mesh_objects)} mesh part(s), "
+            f"{sum(s['vertex_count'] for s in subset_stats)} vertices, "
+            f"{sum(s['index_count'] // 3 for s in subset_stats)} triangles, and "
+            f"{len(morph_metadata.get('targets', [])) if has_morph else 0} facial shape(s)."
         )
         return {'FINISHED'}

@@ -12,10 +12,42 @@ import struct
 import uuid
 from types import SimpleNamespace
 
+
+def model_topology_signature(indices):
+    values = tuple(int(index) & 0xFFFFFFFF for index in indices)
+    payload = struct.pack(f"<{len(values)}I", *values) if values else b""
+    return hashlib.sha1(payload).hexdigest()
+
+
+def model_corner_normal_signature(normals):
+    digest = hashlib.sha1()
+    for normal in normals:
+        values = getattr(normal, "vector", normal)
+        packed = tuple(
+            max(-32767, min(32767, int(round(float(values[axis]) * 32767.0))))
+            for axis in range(3)
+        )
+        digest.update(struct.pack("<3h", *packed))
+    return digest.hexdigest()
+
+
 try:
     import numpy as np
 except Exception:  
     np = SimpleNamespace()
+
+
+def model_shape_key_delta_signature(basis_key, target_key):
+    basis_count = len(getattr(basis_key, "data", ()) or ())
+    target_count = len(getattr(target_key, "data", ()) or ())
+    if basis_count != target_count:
+        return ""
+    basis = np.empty(basis_count * 3, dtype=np.float32)
+    target = np.empty(target_count * 3, dtype=np.float32)
+    basis_key.data.foreach_get("co", basis)
+    target_key.data.foreach_get("co", target)
+    delta = np.asarray(target - basis, dtype="<f4")
+    return hashlib.sha1(delta.tobytes(order="C")).hexdigest()
 
 try:
     import mathutils

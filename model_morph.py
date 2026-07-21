@@ -9,7 +9,8 @@ MORPH_SUBSET_SIZE = 8
 MORPH_BATCH_SIZE = 20
 MORPH_BATCH_DELTA_COUNT = 64
 MORPH_FLAG_DEBUG_UNCOMPRESSED = 0x1000
-MORPH_DELTA_PRECISION = 0.0001
+MORPH_DELTA_PRECISION = 0.000001
+MORPH_VERTEX_DELTA_EPSILON = 0.00000001
 MORPH_TARGET_MAX = 4096
 MORPH_TARGET_SUBSET_MAX = 255
 MORPH_NAME_BYTES_MAX = 127
@@ -17,7 +18,7 @@ MORPH_STITCH_INDEX_MAX = 32
 # this is stupid
 SMOOTH_INFO_SIZE = 64
 SMOOTH_SUBSET_SIZE = 12
-SMOOTH_POSITION_TOLERANCE = 0.0001
+SMOOTH_POSITION_TOLERANCE = 0.00000656564225 #taken from engine
 SMOOTH_NORMAL_DOT_TOLERANCE = 0.998
 MORPH_CONTROL_PREFIX = "engine_morph_"
 
@@ -405,7 +406,7 @@ def _normalize_encode_targets(targets, precision):
             filtered = {}
             for vertex_index, delta in subset.get("deltas", {}).items():
                 value = (float(delta[0]), float(delta[1]), float(delta[2]))
-                if math.sqrt(sum(component * component for component in value)) >= float(precision):
+                if math.sqrt(sum(component * component for component in value)) >= MORPH_VERTEX_DELTA_EPSILON:
                     filtered[int(vertex_index)] = value
             if filtered:
                 subsets.append({"subset_index": int(subset["subset_index"]), "deltas": filtered})
@@ -719,7 +720,7 @@ def encode_model_smooth2(
             stitches.append((int(local_start) << 16) | len(indices))
             stitch_indices.extend(int(index) for index in indices)
         subset_infos.append((
-            len(subset.get("vertices", [])) if subset_stitches else 0,
+            len(subset.get("vertices", [])) if int(subset.get("anim_vert_count", 0)) > 0 else 0,
             len(subset_stitches),
             stitch_start,
             index_start,

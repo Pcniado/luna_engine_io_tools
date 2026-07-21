@@ -82,6 +82,7 @@ def menu_func_export_model(self, context):
 CLASSES = (
     properties.MODEL_PG_morph_preview,
     model_import.ImportEngineModel,
+    model_export.MODEL_OT_select_original_model_for_export,
     model_export.ExportEngineModel,
     anim_import.ImportEngineAnim,
     anim_export.ExportEngineAnim,

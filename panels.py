@@ -314,13 +314,28 @@ def _draw_model_source_panel(layout, arm):
         col.label(text="Deformations: none in source")
 
 
+def _model_has_shape_keys(arm):
+    for obj in bpy.data.objects:
+        if (
+            getattr(obj, "type", None) != 'MESH'
+            or getattr(obj, "parent", None) != arm
+            or obj.get("engine_bounds_type", "") == "subset_aabb"
+        ):
+            continue
+        shape_keys = getattr(getattr(obj, "data", None), "shape_keys", None)
+        if len(list(getattr(shape_keys, "key_blocks", []) or [])) > 1:
+            return True
+    return False
+
+
 def _draw_model_morph_panel(layout, context, arm):
     controls = _json_list_idprop(arm, "engine_model_morph_controls_json")
     source_has_deformations = bool(
         arm.get("engine_model_source_has_morphs", False)
         or arm.get("engine_model_source_has_ziva", False)
     )
-    if not controls and not source_has_deformations:
+    has_shape_keys = _model_has_shape_keys(arm)
+    if not controls and not source_has_deformations and not has_shape_keys:
         return
     if not _draw_model_foldout(layout, arm, "engine_model_show_morphs", "Shape Keys"):
         return
@@ -334,7 +349,15 @@ def _draw_model_morph_panel(layout, context, arm):
     header.label(text=f"Armature Shape Key Preview: {len(controls)}")
     header.operator(MODEL_OT_sync_morph_controls.bl_idname, text="", icon='FILE_REFRESH')
     if not controls:
-        box.label(text="Parent the custom meshes, then create the original blendshape names.")
+        if has_shape_keys:
+            box.label(text="Shape keys were found in this Blender file.")
+            box.operator(
+                MODEL_OT_sync_morph_controls.bl_idname,
+                text="Refresh Shape Key Controls",
+                icon='FILE_REFRESH',
+            )
+        else:
+            box.label(text="Parent the custom meshes, then create the original blendshape names.")
         return
     box.prop(arm, "engine_model_morph_search", text="", icon='VIEWZOOM')
     search = str(getattr(arm, "engine_model_morph_search", "") or "").strip().casefold()

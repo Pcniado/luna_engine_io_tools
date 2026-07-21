@@ -9,6 +9,7 @@ import struct
 import numpy as np
 
 from .hashes import BLOCK_HASHES, string_crc32
+from .utils import model_shape_key_delta_signature
 
 
 ZIVA_INFO_SIZE = 144
@@ -25,6 +26,7 @@ ZIVA_STAGE_RBF = 2
 ZIVA_STAGE_EIGEN = 3
 ZIVA_STAGE_TENSOR = 4
 ZIVA_STAGE_SCATTER = 5
+ZIVA_TRANSFER_DELTA_EPSILON = 0.00000001
 ZIVA_SUPPORTED_STAGES = {
     ZIVA_STAGE_KERNEL,
     ZIVA_STAGE_RBF,
@@ -767,7 +769,8 @@ def _ziva_write_shape_key(obj, channel, local_delta, overwrite=False):
 
     if len(local_delta) != len(obj.data.vertices):
         raise ValueError(f"{obj.name}: transfer delta count does not match mesh vertices")
-    affected = np.linalg.norm(local_delta, axis=1) >= 0.0001
+# improves accuracy?
+    affected = np.linalg.norm(local_delta, axis=1) >= ZIVA_TRANSFER_DELTA_EPSILON
     if not np.any(affected):
         return "EMPTY"
     if obj.data.shape_keys is None or not obj.data.shape_keys.key_blocks:
@@ -797,6 +800,7 @@ def _ziva_write_shape_key(obj, channel, local_delta, overwrite=False):
         "index": int(channel["index"]),
         "ziva_kind": channel["kind"],
         "driver_status": channel["driver_status"],
+        "source_delta_signature": model_shape_key_delta_signature(basis, key),
     }
     obj["engine_morph_targets_json"] = json.dumps(metadata, separators=(",", ":"), sort_keys=True)
     obj["engine_morph_shape_keys_imported"] = True
