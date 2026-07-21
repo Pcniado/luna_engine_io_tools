@@ -1,6 +1,6 @@
 schema_version = "1.0.0"
 id = "luna_engine_io"
-version = "2.1.0"
+version = "2.2.0"
 name = "Luna Engine IO Tools"
 tagline = "Import/export Luna Engine model files and import/export AnimClip animation data"
 maintainer = "Pcniado"

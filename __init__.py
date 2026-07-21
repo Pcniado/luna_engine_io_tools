@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Luna Engine IO Tools",
     "author": "Pcniado",
-    "version": (2, 1, 0),
+    "version": (2, 2, 0),
     "blender": (5, 0, 0),
     "location": "File > Import/Export > Luna Engine Model / Luna Engine Anim",
     "description": "Import/export Luna Engine model files and import/export AnimClip animation data",
